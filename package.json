@@ -1,0 +1,39 @@
+{
+  "name": "edgejump",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Native SSH Bastion & JumpServer",
+  "scripts": {
+    "dev": "wrangler dev",
+    "dev:web": "vite --config vite.config.ts",
+    "build:web": "vite build --config vite.config.ts",
+    "typecheck": "tsc -p tsconfig.worker.json --noEmit && tsc -p tsconfig.frontend.json --noEmit",
+    "test": "node --test --experimental-strip-types tests/*.test.ts",
+    "build": "npm run build:web"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/xterm": "^6.0.0",
+    "lucide-react": "^1.16.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "zmodem.js": "^0.1.10"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260727.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^22.20.4",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.2",
+    "vite": "^7.0.6",
+    "wrangler": "^4.134.0"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}

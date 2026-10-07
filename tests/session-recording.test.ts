@@ -1,0 +1,500 @@
+// Unit and Integration Tests for Session Recording, Hash Chaining, Command Heuristics, and Durable Objects
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+  compressGzip,
+  decompressGzip,
+  computeChunkHash,
+  computeRollingHash,
+  SessionRecorder,
+  hexToBytes,
+  bytesToHex,
+  type TerminalEvent,
+} from '../src/durable/recording.ts';
+import { CommandHeuristicsTracker } from '../src/durable/heuristics.ts';
+import { RateLimitDO } from '../src/durable/RateLimitDO.ts';
+import { SSHSessionDO } from '../src/durable/SSHSessionDO.ts';
+
+test('recording: WebStreams CompressionStream(gzip) compresses and decompressGzip restores exact content', async () => {
+  const events: TerminalEvent[] = [
+    { seq: 1, t: 0, type: 'connect', cols: 80, rows: 24 },
+    { seq: 2, t: 150, type: 'stdout', data: 'Welcome to Ubuntu 24.04 LTS (GNU/Linux 6.8.0-generic x86_64)\r\n' },
+    { seq: 3, t: 300, type: 'stdout', data: 'deploy@prod-bastion:~$ ' },
+    { seq: 4, t: 1200, type: 'resize', cols: 140, rows: 45 },
+    { seq: 5, t: 2500, type: 'disconnect', reason: 'client_closed' },
+  ];
+
+  const jsonl = events.map((e) => JSON.stringify(e)).join('\n') + '\n';
+  const rawBytes = new TextEncoder().encode(jsonl);
+
+  // Compress with WebStreams CompressionStream('gzip')
+  const compressed = await compressGzip(rawBytes);
+
+  // Verify gzip magic bytes (0x1f, 0x8b)
+  assert.equal(compressed[0], 0x1f);
+  assert.equal(compressed[1], 0x8b);
+  assert.ok(compressed.length > 0);
+
+  // Decompress with WebStreams DecompressionStream('gzip')
+  const decompressed = await decompressGzip(compressed);
+  assert.deepEqual(decompressed, rawBytes);
+
+  // Verify JSON parsing of restored events
+  const restoredLines = new TextDecoder().decode(decompressed).trim().split('\n');
+  assert.equal(restoredLines.length, events.length);
+  const parsedEvents = restoredLines.map((l) => JSON.parse(l));
+  assert.deepEqual(parsedEvents, events);
+});
+
+test('recording: SHA-256 rolling hash chain integrity and tamper detection', async () => {
+  const chunk1 = new TextEncoder().encode('{"seq":1,"t":0,"type":"connect","cols":80,"rows":24}\n');
+  const chunk2 = new TextEncoder().encode('{"seq":2,"t":100,"type":"stdout","data":"uptime: up 42 days"}\n');
+  const chunk3 = new TextEncoder().encode('{"seq":3,"t":200,"type":"disconnect","reason":"closed"}\n');
+
+  const gzip1 = await compressGzip(chunk1);
+  const gzip2 = await compressGzip(chunk2);
+  const gzip3 = await compressGzip(chunk3);
+
+  const hash1 = await computeChunkHash(gzip1);
+  const hash2 = await computeChunkHash(gzip2);
+  const hash3 = await computeChunkHash(gzip3);
+
+  assert.equal(hash1.length, 64);
+  assert.equal(hash2.length, 64);
+  assert.equal(hash3.length, 64);
+
+  // Chunk 1: first rolling hash is hash1
+  const rolling1 = await computeRollingHash(null, hash1);
+  assert.equal(rolling1, hash1);
+
+  // Chunk 2: rolling2 = SHA256(rolling1 || hash2)
+  const rolling2 = await computeRollingHash(rolling1, hash2);
+  assert.notEqual(rolling2, rolling1);
+
+  // Verify manual computation of rolling2
+  const combinedBytes1_2 = new Uint8Array([...hexToBytes(rolling1), ...hexToBytes(hash2)]);
+  const expectedRolling2 = bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', combinedBytes1_2)));
+  assert.equal(rolling2, expectedRolling2);
+
+  // Chunk 3: rolling3 = SHA256(rolling2 || hash3)
+  const rolling3 = await computeRollingHash(rolling2, hash3);
+  const combinedBytes2_3 = new Uint8Array([...hexToBytes(rolling2), ...hexToBytes(hash3)]);
+  const expectedRolling3 = bytesToHex(new Uint8Array(await crypto.subtle.digest('SHA-256', combinedBytes2_3)));
+  assert.equal(rolling3, expectedRolling3);
+
+  // Tamper detection: if chunk 2 was tampered with, rolling hash chain changes!
+  const tamperedGzip2 = new Uint8Array(gzip2);
+  tamperedGzip2[tamperedGzip2.length - 1] ^= 0xff; // flip bit
+  const tamperedHash2 = await computeChunkHash(tamperedGzip2);
+  assert.notEqual(tamperedHash2, hash2);
+
+  const tamperedRolling2 = await computeRollingHash(rolling1, tamperedHash2);
+  const tamperedRolling3 = await computeRollingHash(tamperedRolling2, hash3);
+
+  assert.notEqual(tamperedRolling2, rolling2);
+  assert.notEqual(tamperedRolling3, rolling3);
+});
+
+test('recording: SessionRecorder buffers events, uploads chunks and manifest to R2', async () => {
+  const r2Storage = new Map<string, { data: Uint8Array; metadata: any }>();
+  const mockR2Bucket = {
+    async put(key: string, value: Uint8Array | string, options?: any) {
+      const data = typeof value === 'string' ? new TextEncoder().encode(value) : value;
+      r2Storage.set(key, { data, metadata: options?.customMetadata });
+    },
+  };
+
+  const sessionId = 'test-session-recording-001';
+  const recorder = new SessionRecorder(sessionId, mockR2Bucket as any, 1700000000000);
+
+  recorder.recordEvent('connect', undefined, { cols: 80, rows: 24 });
+  recorder.recordEvent('stdout', 'Last login: Wed Oct 7 10:00:00 2026\r\n');
+  recorder.recordEvent('resize', undefined, { cols: 120, rows: 40 });
+
+  // Manually flush first chunk
+  const chunkRes = await recorder.flushChunk();
+  assert.ok(chunkRes);
+  assert.equal(chunkRes.chunkIndex, 1);
+  assert.ok(r2Storage.has(chunkRes.path));
+
+  // Verify uploaded chunk in R2 can be decompressed
+  const storedChunk = r2Storage.get(chunkRes.path)!;
+  const decompressedChunk = await decompressGzip(storedChunk.data);
+  const chunkText = new TextDecoder().decode(decompressedChunk);
+  assert.ok(chunkText.includes('Last login'));
+  assert.ok(chunkText.includes('connect'));
+
+  // Close session recorder
+  const manifest = await recorder.close('user_exit');
+  assert.equal(manifest.sessionId, sessionId);
+  assert.equal(manifest.chunkCount, 2); // 1st chunk + 2nd chunk containing disconnect
+  assert.ok(manifest.firstChunkHash);
+  assert.ok(manifest.finalHash);
+
+  // Verify manifest.json in R2
+  const manifestPath = `${recorder.getRecordingPrefix()}/manifest.json`;
+  assert.ok(r2Storage.has(manifestPath));
+  const manifestJson = JSON.parse(new TextDecoder().decode(r2Storage.get(manifestPath)!.data));
+  assert.equal(manifestJson.sessionId, sessionId);
+  assert.equal(manifestJson.chunkCount, 2);
+  assert.equal(manifestJson.finalHash, manifest.finalHash);
+});
+
+test('heuristics: command line reconstruction across Enter, Backspace, Ctrl+C, Ctrl+U', () => {
+  const tracker = new CommandHeuristicsTracker('test-heuristics-001');
+
+  // 1. Basic command
+  let cmds = tracker.feedStdin('ls -la\r');
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].command, 'ls -la');
+  assert.equal(cmds[0].redacted, 0);
+
+  // 2. Command with Backspace (\x7f DEL)
+  cmds = tracker.feedStdin('dockre\x7f\x7fer ps\r');
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].command, 'docker ps');
+  assert.equal(cmds[0].redacted, 0);
+
+  // 3. Command with Backspace (\x08 BS)
+  cmds = tracker.feedStdin('whom\x08ami\r');
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].command, 'whoami');
+
+  // 4. Ctrl+C (\x03) aborts current line
+  cmds = tracker.feedStdin('rm -rf /\x03');
+  assert.equal(cmds.length, 0);
+  assert.equal(tracker.getCurrentLineBuffer(), '');
+
+  // Next command starts fresh
+  cmds = tracker.feedStdin('pwd\r');
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].command, 'pwd');
+
+  // 5. Ctrl+U (\x15) clears current line
+  cmds = tracker.feedStdin('bad command line\x15systemctl status nginx\r');
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].command, 'systemctl status nginx');
+
+  // 6. Multiple commands in one stream
+  cmds = tracker.feedStdin('date\runame -a\r');
+  assert.equal(cmds.length, 2);
+  assert.equal(cmds[0].command, 'date');
+  assert.equal(cmds[1].command, 'uname -a');
+});
+
+test('heuristics: sensitive password prompt detection and [REDACTED] redaction', () => {
+  const tracker = new CommandHeuristicsTracker('test-heuristics-redact');
+
+  // Normal command
+  tracker.feedStdout('deploy@server:~$ ');
+  let cmds = tracker.feedStdin('sudo apt update\r');
+  assert.equal(cmds[0].command, 'sudo apt update');
+  assert.equal(cmds[0].redacted, 0);
+
+  // Sudo password prompt
+  tracker.feedStdout('[sudo] password for deploy: ');
+  assert.equal(tracker.isPromptSensitive(), true);
+
+  // User types secret password
+  cmds = tracker.feedStdin('MySuperSecretPassword123!\r');
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].command, '[REDACTED]');
+  assert.equal(cmds[0].redacted, 1);
+  assert.equal(tracker.isPromptSensitive(), false);
+
+  // Next normal command is NOT redacted
+  tracker.feedStdout('\r\nHit:1 http://archive.ubuntu.com/ubuntu noble InRelease\r\ndeploy@server:~$ ');
+  cmds = tracker.feedStdin('echo done\r');
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].command, 'echo done');
+  assert.equal(cmds[0].redacted, 0);
+
+  // Passphrase prompt
+  tracker.feedStdout('Enter passphrase for key /home/deploy/.ssh/id_ed25519: ');
+  assert.equal(tracker.isPromptSensitive(), true);
+  cmds = tracker.feedStdin('KeyPassphrase999\r');
+  assert.equal(cmds[0].command, '[REDACTED]');
+  assert.equal(cmds[0].redacted, 1);
+
+  // API Token prompt
+  tracker.feedStdout('Please enter your GitHub personal access token: ');
+  assert.equal(tracker.isPromptSensitive(), true);
+  cmds = tracker.feedStdin('ghp_abcdef1234567890\r');
+  assert.equal(cmds[0].command, '[REDACTED]');
+  assert.equal(cmds[0].redacted, 1);
+});
+
+test('ratelimit: RateLimitDO enforces sliding window and lockout TTL', async () => {
+  const rateLimit = new RateLimitDO();
+  const testIp = '198.51.100.25';
+  const testUser = 'admin_user';
+
+  // 1. Initial check - allowed
+  let checkRes = await rateLimit.checkLogin(testIp, testUser, { maxAttempts: 5, windowMs: 300_000 });
+  assert.equal(checkRes.allowed, true);
+  assert.equal(checkRes.remaining, 5);
+  assert.equal(checkRes.lockoutTtl, 0);
+
+  // 2. 4 failed attempts - still allowed, remaining decreases
+  for (let i = 1; i <= 4; i++) {
+    const failRes = await rateLimit.recordLoginFailure(testIp, testUser, { maxAttempts: 5, windowMs: 300_000 });
+    assert.equal(failRes.allowed, true);
+    assert.equal(failRes.remaining, 5 - i);
+    assert.equal(failRes.lockoutTtl, 0);
+  }
+
+  // 3. 5th failed attempt - locked out!
+  const fifthFail = await rateLimit.recordLoginFailure(testIp, testUser, { maxAttempts: 5, windowMs: 300_000 });
+  assert.equal(fifthFail.allowed, false);
+  assert.equal(fifthFail.remaining, 0);
+  assert.ok(fifthFail.lockoutTtl > 0 && fifthFail.lockoutTtl <= 300);
+
+  // 4. Subsequent check is blocked
+  checkRes = await rateLimit.checkLogin(testIp, testUser, { maxAttempts: 5, windowMs: 300_000 });
+  assert.equal(checkRes.allowed, false);
+  assert.equal(checkRes.remaining, 0);
+  assert.ok(checkRes.lockoutTtl > 0);
+
+  // 5. Successful login resets counter
+  await rateLimit.resetLogin(testIp, testUser);
+  checkRes = await rateLimit.checkLogin(testIp, testUser, { maxAttempts: 5, windowMs: 300_000 });
+  assert.equal(checkRes.allowed, true);
+  assert.equal(checkRes.remaining, 5);
+  assert.equal(checkRes.lockoutTtl, 0);
+
+  // 6. Test HTTP fetch interface of RateLimitDO
+  const httpCheckReq = new Request('http://localhost/check', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ip: testIp, username: testUser }),
+  });
+  const httpCheckRes = await rateLimit.fetch(httpCheckReq);
+  assert.equal(httpCheckRes.status, 200);
+  const checkJson = (await httpCheckRes.json()) as any;
+  assert.equal(checkJson.allowed, true);
+});
+
+test('ssh-session: SSHSessionDO HTTP endpoints (init, ticket, status, terminate)', async () => {
+  const session = new SSHSessionDO();
+
+  // 1. POST /init
+  const initReq = new Request('http://localhost/init', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sessionId: 'sess-unit-test-101',
+      userId: 'usr_admin',
+      assetId: 'ast_web_01',
+      accountId: 'acc_deploy',
+      host: '203.0.113.10',
+      port: 22,
+      username: 'deploy',
+      authMethod: 'password',
+      password: 'InitialPassword123',
+    }),
+  });
+  const initRes = await session.fetch(initReq);
+  assert.equal(initRes.status, 200);
+  const initJson = (await initRes.json()) as any;
+  assert.equal(initJson.success, true);
+  assert.equal(initJson.sessionId, 'sess-unit-test-101');
+  assert.equal(session.getStatus(), 'connecting');
+
+  // 2. POST /ticket
+  const ticketReq = new Request('http://localhost/ticket', { method: 'POST' });
+  const ticketRes = await session.fetch(ticketReq);
+  assert.equal(ticketRes.status, 200);
+  const ticketJson = (await ticketRes.json()) as any;
+  assert.ok(ticketJson.ticket);
+  assert.ok(ticketJson.expiresAt > Date.now());
+
+  // 3. GET /status
+  const statusReq = new Request('http://localhost/status');
+  const statusRes = await session.fetch(statusReq);
+  assert.equal(statusRes.status, 200);
+  const statusJson = (await statusRes.json()) as any;
+  assert.equal(statusJson.sessionId, 'sess-unit-test-101');
+  assert.equal(statusJson.status, 'connecting');
+
+  // 4. POST /terminate
+  const termReq = new Request('http://localhost/terminate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason: 'admin_force_close', actorId: 'usr_superadmin' }),
+  });
+  const termRes = await session.fetch(termReq);
+  assert.equal(termRes.status, 200);
+  const termJson = (await termRes.json()) as any;
+  assert.equal(termJson.success, true);
+  assert.equal(termJson.status, 'terminated');
+  assert.equal(session.getStatus(), 'terminated');
+});
+
+test('tofu: Host key TOFU auto-trusts on first use, verifies on reconnect, blocks on changed', async () => {
+  const hostKeysTable = new Map<string, any>();
+  const auditEventsList: any[] = [];
+
+  const mockDb = {
+    prepare(query: string) {
+      return {
+        bind(...args: any[]) {
+          return {
+            async first<T = any>() {
+              if (query.includes('FROM ssh_host_keys')) {
+                const assetId = args[0];
+                const algo = args[1];
+                return (hostKeysTable.get(`${assetId}:${algo}`) as T) || null;
+              }
+              return null;
+            },
+            async run() {
+              if (query.includes('INSERT INTO ssh_host_keys') || query.includes('ON CONFLICT')) {
+                const id = args[0];
+                const assetId = args[1];
+                const algo = args[2];
+                const fp = args[3];
+                const pubKey = args[4];
+                hostKeysTable.set(`${assetId}:${algo}`, {
+                  id,
+                  asset_id: assetId,
+                  algorithm: algo,
+                  fingerprint: fp,
+                  public_key: pubKey,
+                  status: 'verified',
+                });
+              } else if (query.includes('UPDATE ssh_host_keys SET status =')) {
+                const id = args[0];
+                for (const row of hostKeysTable.values()) {
+                  if (row.id === id) row.status = 'changed';
+                }
+              } else if (query.includes('INSERT INTO audit_events')) {
+                auditEventsList.push({
+                  action: args[4],
+                  resource_type: args[5],
+                  resource_id: args[6],
+                  result: args[10],
+                  metadata: args[11] ? JSON.parse(args[11]) : null,
+                });
+              }
+              return { success: true };
+            },
+          };
+        },
+      };
+    },
+  };
+
+  const mockEnv: any = { DB: mockDb };
+  const session = new SSHSessionDO(undefined, mockEnv);
+
+  // Initialize session
+  await session.fetch(
+    new Request('http://localhost/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: 'sess-tofu-test',
+        userId: 'usr_dev',
+        assetId: 'ast_server_01',
+        accountId: 'acc_root',
+        host: '198.51.100.10',
+        port: 22,
+        username: 'root',
+        authMethod: 'password',
+      }),
+    })
+  );
+
+  const mockKeyBlob = new Uint8Array([0, 0, 0, 11, ...new TextEncoder().encode('ssh-ed25519'), 0, 0, 0, 32, ...new Uint8Array(32).fill(9)]);
+  const initialFingerprint = 'SHA256:InitialValidFingerprint12345678901234567890';
+
+  // 1. First Connect: TOFU auto-records in D1 with status = 'verified' and emits HOST_KEY_TRUSTED
+  await (session as any).processHostKeyTOFU('ssh-ed25519', initialFingerprint, mockKeyBlob);
+
+  const savedKey = hostKeysTable.get('ast_server_01:ssh-ed25519');
+  assert.ok(savedKey);
+  assert.equal(savedKey.fingerprint, initialFingerprint);
+  assert.equal(savedKey.status, 'verified');
+
+  const trustedAudit = auditEventsList.find((a) => a.action === 'HOST_KEY_TRUSTED');
+  assert.ok(trustedAudit);
+  assert.equal(trustedAudit.result, 'success');
+  assert.equal(trustedAudit.metadata.fingerprint, initialFingerprint);
+
+  // 2. Reconnect with identical fingerprint: verified without errors
+  await (session as any).processHostKeyTOFU('ssh-ed25519', initialFingerprint, mockKeyBlob);
+  assert.equal(savedKey.status, 'verified');
+
+  // 3. Changed fingerprint (potential MITM attack): blocks connection, updates status to 'changed', emits HOST_KEY_CHANGED
+  const changedFingerprint = 'SHA256:MaliciousMitmFingerprint09876543210987654321';
+  await assert.rejects(
+    async () => {
+      await (session as any).processHostKeyTOFU('ssh-ed25519', changedFingerprint, mockKeyBlob);
+    },
+    (err: Error) => {
+      return err.message.includes('fingerprint changed') || err.message.includes('Security Alert');
+    }
+  );
+
+  // Status must be marked as 'changed'
+  assert.equal(savedKey.status, 'changed');
+
+  const changedAudit = auditEventsList.find((a) => a.action === 'HOST_KEY_CHANGED');
+  assert.ok(changedAudit);
+  assert.equal(changedAudit.result, 'failure');
+  assert.equal(changedAudit.metadata.expectedFingerprint, initialFingerprint);
+  assert.equal(changedAudit.metadata.actualFingerprint, changedFingerprint);
+
+  await session.terminate();
+});
+
+test('monitor: Read-only auditor watcher receives stdout and resize, and watcher input is ignored', async () => {
+  const session = new SSHSessionDO();
+
+  // Initialize session
+  await session.fetch(
+    new Request('http://localhost/init', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: 'sess-watcher-test',
+        userId: 'usr_dev',
+        assetId: 'ast_web',
+        accountId: 'acc_deploy',
+        host: '203.0.113.10',
+        port: 22,
+        username: 'deploy',
+        authMethod: 'password',
+      }),
+    })
+  );
+
+  // Connect watcher via /monitor
+  const monitorRes = await session.fetch(
+    new Request('http://localhost/monitor', {
+      headers: { Upgrade: 'websocket' },
+    })
+  );
+  assert.equal(monitorRes.status, 101);
+  assert.equal(session.getWatchersCount(), 1);
+
+  // Verify watcher input is discarded and does not throw or corrupt state
+  const watcherWs = (monitorRes as any).webSocket;
+  assert.doesNotThrow(() => {
+    watcherWs.send('malicious_watcher_input_attempt');
+  });
+
+  // Test broadcast to watchers
+  let receivedBroadcast = '';
+  watcherWs.addEventListener('message', (event: any) => {
+    receivedBroadcast = typeof event.data === 'string' ? event.data : new TextDecoder().decode(event.data);
+  });
+
+  (session as any).broadcastToWatchers('broadcast test output\r\n');
+  assert.equal(receivedBroadcast, 'broadcast test output\r\n');
+
+  await session.terminate();
+});
+
