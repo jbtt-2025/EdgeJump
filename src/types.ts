@@ -2,7 +2,7 @@ export interface Env {
   SSH_SESSIONS: DurableObjectNamespace;
   RATE_LIMIT: DurableObjectNamespace;
   DB: D1Database;
-  RECORDINGS: R2Bucket;
+  RECORDINGS?: R2Bucket;
   KV_CACHE: KVNamespace;
   ASSETS?: Fetcher;
 

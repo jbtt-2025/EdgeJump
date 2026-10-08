@@ -142,6 +142,30 @@ test('recording: SessionRecorder buffers events, uploads chunks and manifest to 
   assert.equal(manifestJson.finalHash, manifest.finalHash);
 });
 
+test('recording: SessionRecorder operates gracefully as a no-op when R2 is omitted (optional R2)', async () => {
+  const sessionId = 'test-session-no-r2';
+  // Initialize recorder without R2 bucket
+  const recorder = new SessionRecorder(sessionId, undefined, 1700000000000);
+
+  // Recording events should not throw or buffer
+  recorder.recordEvent('connect', undefined, { cols: 80, rows: 24 });
+  recorder.recordEvent('stdout', 'Linux prompt$ ');
+  recorder.recordEvent('resize', undefined, { cols: 100, rows: 30 });
+
+  // Flush chunk returns null when no R2
+  const chunkRes = await recorder.flushChunk();
+  assert.equal(chunkRes, null);
+  assert.equal(recorder.getChunkCount(), 0);
+
+  // Close returns manifest with zero chunks and empty path
+  const manifest = await recorder.close('client_closed');
+  assert.equal(manifest.sessionId, sessionId);
+  assert.equal(manifest.chunkCount, 0);
+  assert.equal(manifest.firstChunkHash, null);
+  assert.equal(manifest.finalHash, null);
+  assert.equal(manifest.recordingPath, '');
+});
+
 test('heuristics: command line reconstruction across Enter, Backspace, Ctrl+C, Ctrl+U', () => {
   const tracker = new CommandHeuristicsTracker('test-heuristics-001');
 
@@ -330,6 +354,68 @@ test('ssh-session: SSHSessionDO HTTP endpoints (init, ticket, status, terminate)
   assert.equal(termJson.success, true);
   assert.equal(termJson.status, 'terminated');
   assert.equal(session.getStatus(), 'terminated');
+});
+
+test('ssh-session: SSHSessionDO correctly persists recording_status = none when R2 is omitted', async () => {
+  let sessionUpdateData: any = null;
+  const mockDb = {
+    prepare(query: string) {
+      return {
+        bind(...args: any[]) {
+          if (query.includes('UPDATE ssh_sessions SET')) {
+            sessionUpdateData = {
+              status: args[0],
+              endedAt: args[1],
+              reason: args[2],
+              clientClosed: args[3],
+              terminatedBy: args[4],
+              recordingStatus: args[5],
+              recordingPath: args[6],
+              recordingHash: args[7],
+              sessionId: args[8],
+            };
+          }
+          return {
+            async run() {},
+            async first() { return null; },
+            async all() { return { results: [] }; },
+          };
+        },
+      };
+    },
+  };
+
+  const session = new SSHSessionDO({} as any, { DB: mockDb as any } as any);
+
+  const initReq = new Request('http://localhost/init', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sessionId: 'sess-no-r2-test',
+      userId: 'usr_normal',
+      assetId: 'ast_web_02',
+      accountId: 'acc_deploy',
+      host: '203.0.113.11',
+      port: 22,
+      username: 'deploy',
+      authMethod: 'password',
+      password: 'SamplePassword',
+    }),
+  });
+  await session.fetch(initReq);
+
+  const termReq = new Request('http://localhost/terminate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ reason: 'user_exit' }),
+  });
+  await session.fetch(termReq);
+
+  assert.ok(sessionUpdateData);
+  assert.equal(sessionUpdateData.status, 'terminated');
+  assert.equal(sessionUpdateData.recordingStatus, 'none');
+  assert.equal(sessionUpdateData.recordingPath, null);
+  assert.equal(sessionUpdateData.recordingHash, null);
 });
 
 test('tofu: Host key TOFU auto-trusts on first use, verifies on reconnect, blocks on changed', async () => {

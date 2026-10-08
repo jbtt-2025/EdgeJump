@@ -429,10 +429,11 @@ export async function getSessionRecording(
   const session = await getSessionDetail(sessionId, env.DB);
   if (!session) return null;
 
-  const prefix = session.recording_path || `recordings/${sessionId}`;
-  if (!env.RECORDINGS) {
-    return { manifest: { sessionId, chunkCount: 0, finalHash: session.recording_hash }, chunks: [] };
+  if (!env.RECORDINGS || !session.recording_path || session.recording_status === 'none') {
+    return null;
   }
+
+  const prefix = session.recording_path;
 
   const manifestObj = await env.RECORDINGS.get(`${prefix}/manifest.json`);
   let manifest = null;

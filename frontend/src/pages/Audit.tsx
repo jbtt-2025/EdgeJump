@@ -37,7 +37,7 @@ export const Audit: React.FC<AuditProps> = ({ onOpenMonitor }) => {
   }, [tab]);
 
   const handleTerminate = async (sessionId: string) => {
-    if (confirm('确认强制终止此在线会话？断开后将立即冲刷录像至 R2 并记录审计事件。')) {
+    if (confirm('确认强制终止此在线会话？断开后将立即切断连接并记录审计事件。')) {
       await api.terminateSession(sessionId);
       loadData();
     }

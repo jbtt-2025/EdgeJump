@@ -2,7 +2,7 @@
 
 > 基于 Cloudflare Workers 架构构建的轻量级、无传统中转服务器的现代化企业级 SSH 堡垒机 / JumpServer。
 
-前端单页应用与后端服务一体化运行于 Cloudflare 全球边缘网络，利用 Durable Objects 进行长连接会话与状态维护，依托 D1 关系型数据库、R2 对象存储与 KV 实现持久化与存储隔离，彻底摆脱传统堡垒机对固定中转虚机、独立网关、Redis 与 PostgreSQL 等重型组件的运维依赖。
+前端单页应用与后端服务一体化运行于 Cloudflare 全球边缘网络，利用 Durable Objects 进行长连接会话与状态维护，依托 D1 关系型数据库、KV 以及可选的 R2 对象存储实现持久化与存储隔离，彻底摆脱传统堡垒机对固定中转虚机、独立网关、Redis 与 PostgreSQL 等重型组件的运维依赖。
 
 ---
 
@@ -35,11 +35,12 @@
 
 ### 5. 全链路会话审计与录像回放
 * **实时旁路监控（Live Monitor）**：安全审计员与管理员可对进行中的在线会话进行单向只读监视，不干扰终端用户的正常输入。
-* **在线会话强制阻断（Terminate）**：管理员可一键终止任意异常在线会话，DO 实时切断 SSH Channel 与底层 TCP 链路，并立即封存录像。
-* **全量终端录像回放**：会话输出事件流（stdout、resize、时间戳）以流式分块压缩持久化至 R2 对象存储，内置播放器支持播放、暂停、进度条拖拽与 1x/2x/4x 变速回放。
-* **录像哈希链防篡改**：每个录像分块严格计算 SHA-256 并生成链式哈希（Hash Chain），D1 同步存证最终指纹，确保证据链真实有效。
-* **命令审计与脱敏**：实时重建终端输入行命令记录，自动识别密码输入并进行脱敏标注。
-* **系统操作全量审计**：记录用户登录、资产变更、凭证替换、授权分配与管理员介入等全维度审计事件。
+* **在线会话强制阻断（Terminate）**：管理员可一键终止任意异常在线会话，DO 实时切断 SSH Channel 与底层 TCP 链路，并记录终止审计。
+* **命令审计与脱敏**：实时重建终端输入行命令记录，自动识别密码输入并进行脱敏标注，数据直接写入 D1 数据库（无需 R2）。
+* **系统操作全量审计**：记录用户登录、资产变更、凭证替换、授权分配与管理员介入等全维度审计事件，永久持久化于 D1（无需 R2）。
+* **全量终端录像回放（可选功能）**：
+  * **启用 R2 时**：会话事件流（stdout、resize、时间戳）流式分块压缩上传至 R2，内置回放器支持变速播放与拖拽，分块支持 SHA-256 哈希链防篡改。
+  * **未配置 R2 时**：系统自动跳过录像写入，**不保存审计录像回放**，列表状态显示为“未录像”；堡垒机所有连接、授权、监控与审计日志等核心功能完全正常运行。
 
 ### 6. 边缘原生高可用与防爆破防护
 * **Durable Object 会话隔离**：每个 SSH Session 分配专属 DO 实例，独立管理 TCP 链路、PTY 状态与心跳保活。
@@ -53,7 +54,7 @@
 2. **Node.js**：版本 `>= 22.12.0`。
 3. **包管理工具**：npm（随 Node.js 自带）。
 4. **Cloudflare API 凭证**：
-   * `CLOUDFLARE_API_TOKEN`：具有 Workers、D1、R2、KV 的编辑与读写权限。
+   * `CLOUDFLARE_API_TOKEN`：具有 Workers、D1、KV 的编辑与读写权限（若启用录像功能，则需包含 R2 权限）。
    * `CLOUDFLARE_ACCOUNT_ID`：Cloudflare 账户 ID（可在仪表板右侧获取）。
 
 ---
@@ -70,17 +71,17 @@ npm install
 
 ### 步骤 2：创建 Cloudflare 资源
 
-在命令行通过 Wrangler 创建项目所需的 D1 数据库、R2 存储桶和 KV 命名空间：
+在命令行通过 Wrangler 创建项目所需的必要资源（D1 数据库与 KV 命名空间）：
 
 ```bash
-# 1. 创建 D1 关系型数据库
+# 1. 创建 D1 关系型数据库 (必要)
 npx wrangler d1 create edgejump-db
 
-# 2. 创建用于存放录像的 R2 存储桶
-npx wrangler r2 bucket create edgejump-recordings
-
-# 3. 创建用于配置缓存的 KV 命名空间
+# 2. 创建配置缓存 KV 命名空间 (必要)
 npx wrangler kv namespace create edgejump-kv
+
+# 3. [可选] 如需开启会话录像与回放，创建 R2 存储桶；若不需要录像回放可跳过此步：
+npx wrangler r2 bucket create edgejump-recordings
 ```
 
 ### 步骤 3：配置 `wrangler.toml`
@@ -124,13 +125,14 @@ database_name = "edgejump-db"
 database_id = "<填入你的 edgejump-db database_id>"
 migrations_dir = "migrations"
 
-[[r2_buckets]]
-binding = "RECORDINGS"
-bucket_name = "edgejump-recordings"
-
 [[kv_namespaces]]
 binding = "KV_CACHE"
 id = "<填入你的 edgejump-kv namespace id>"
+
+# [可选] R2 存储桶（仅在需要会话录像回放功能时取消注释；不需要可保持注释）
+# [[r2_buckets]]
+# binding = "RECORDINGS"
+# bucket_name = "edgejump-recordings"
 ```
 
 ### 步骤 4：配置安全环境变量（Worker Secrets）
@@ -187,8 +189,8 @@ npx wrangler deploy
 
 在 Cloudflare 仪表盘或通过本地 Wrangler 完成以下资源创建与密钥设置：
 1. 创建 D1 数据库：`edgejump-db`
-2. 创建 R2 存储桶：`edgejump-recordings`
-3. 创建 KV 命名空间：`edgejump-kv`
+2. 创建 KV 命名空间：`edgejump-kv`
+3. （可选）若需要录像回放，创建 R2 存储桶 `edgejump-recordings` 并在 `wrangler.toml` 中取消注释 `[[r2_buckets]]`；若不需要录像回放可不创建。
 4. 将对应的 `database_id` 和 KV `id` 提交到仓库的 `wrangler.toml` 中。
 5. 通过 `npx wrangler secret put` 配置好 Worker 运行时的三个环境变量：
    * `CREDENTIAL_KEK_V1`
@@ -201,7 +203,7 @@ npx wrangler deploy
 
 | Secret 名称 | 说明 | 示例 / 获取位置 |
 | :--- | :--- | :--- |
-| `CLOUDFLARE_API_TOKEN` | 具备 Workers、D1、R2、KV 权限的 API Token | Cloudflare 仪表板 -> 我的个人资料 -> API 令牌 |
+| `CLOUDFLARE_API_TOKEN` | 具备 Workers、D1、KV（及可选 R2）权限的 API Token | Cloudflare 仪表板 -> 我的个人资料 -> API 令牌 |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 账户 ID | Cloudflare 仪表板 Workers 页面右侧栏 |
 
 ### 步骤 3：触发自动化流水线
@@ -230,7 +232,7 @@ npx wrangler deploy
 ### 常用开发与测试命令
 
 ```bash
-# 运行单元与集成测试（内置 70+ 测试项）
+# 运行单元与集成测试（内置 80+ 测试项）
 npm test
 
 # 执行前端与 Worker 严格类型校验
@@ -252,6 +254,6 @@ npx wrangler tail
 # 执行远程 D1 数据库直接查询
 npx wrangler d1 execute edgejump-db --remote --command "SELECT id, username, status FROM users;"
 
-# 查看远程录像存储桶对象列表
+# [可选] 查看远程录像存储桶对象列表（启用 R2 时可用）
 npx wrangler r2 object list edgejump-recordings
 ```

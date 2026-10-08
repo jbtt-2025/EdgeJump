@@ -1004,14 +1004,14 @@ export class SSHSessionDO {
       // Ignored
     }
 
-    // 3. Flush Recording and save manifest to R2
+    // 3. Flush Recording and save manifest to R2 (if R2 is configured)
     let recordingHash: string | null = null;
     let recordingPath: string | null = null;
-    if (this.recorder) {
+    if (this.recorder && this.env?.RECORDINGS) {
       try {
         const manifest = await this.recorder.close(reason);
         recordingHash = manifest.finalHash;
-        recordingPath = manifest.recordingPath;
+        recordingPath = manifest.recordingPath || null;
       } catch (err) {
         console.error('[SSHSessionDO] Failed to close recording:', err);
       }
@@ -1092,6 +1092,7 @@ export class SSHSessionDO {
     if (!this.env?.DB) return;
 
     const endedAt = Date.now();
+    const recordingStatus = (this.env?.RECORDINGS && recordingPath) ? 'completed' : 'none';
     await this.env.DB.prepare(
       `UPDATE ssh_sessions SET
          status = ?,
@@ -1099,7 +1100,7 @@ export class SSHSessionDO {
          disconnect_reason = ?,
          client_closed = ?,
          terminated_by = ?,
-         recording_status = 'completed',
+         recording_status = ?,
          recording_path = ?,
          recording_hash = ?
        WHERE id = ?`
@@ -1110,6 +1111,7 @@ export class SSHSessionDO {
         reason,
         this.clientClosed ? 1 : 0,
         this.terminatedBy,
+        recordingStatus,
         recordingPath,
         recordingHash,
         this.sessionId

@@ -680,6 +680,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       ) {
         return jsonError('Permission denied', 403);
       }
+      if (!env.RECORDINGS) {
+        return jsonError('Session recording replay is not available (R2 storage is optional and not configured)', 404);
+      }
       const recording = await getSessionRecording(sessionId, env);
       if (!recording) return jsonError('Recording not found', 404);
       return jsonResponse(recording);

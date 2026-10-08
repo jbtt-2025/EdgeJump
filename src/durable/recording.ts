@@ -155,7 +155,9 @@ export class SessionRecorder {
     const dd = String(date.getUTCDate()).padStart(2, '0');
     this.recordingPrefix = `recordings/${yyyy}/${mm}/${dd}/${sessionId}`;
 
-    this.startPeriodicFlush();
+    if (this.r2Bucket) {
+      this.startPeriodicFlush();
+    }
   }
 
   getRecordingPrefix(): string {
@@ -195,7 +197,7 @@ export class SessionRecorder {
   }
 
   recordEvent(type: TerminalEventType, data?: unknown, extra?: Partial<TerminalEvent>): void {
-    if (this.isClosed) return;
+    if (this.isClosed || !this.r2Bucket) return;
 
     this.seqNum++;
     const t = Math.max(0, Date.now() - this.startedAt);
@@ -224,7 +226,7 @@ export class SessionRecorder {
   }
 
   async flushChunk(): Promise<ChunkFlushResult | null> {
-    if (this.eventsBuffer.length === 0) {
+    if (this.eventsBuffer.length === 0 || !this.r2Bucket) {
       return null;
     }
 
@@ -286,7 +288,21 @@ export class SessionRecorder {
         finalHash: this.rollingHash,
         startedAt: this.startedAt,
         endedAt: Date.now(),
-        recordingPath: this.recordingPrefix,
+        recordingPath: this.r2Bucket ? this.recordingPrefix : '',
+      };
+    }
+
+    if (!this.r2Bucket) {
+      this.isClosed = true;
+      this.stopPeriodicFlush();
+      return {
+        sessionId: this.sessionId,
+        chunkCount: 0,
+        firstChunkHash: null,
+        finalHash: null,
+        startedAt: this.startedAt,
+        endedAt: Date.now(),
+        recordingPath: '',
       };
     }
 

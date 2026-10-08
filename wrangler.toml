@@ -34,9 +34,10 @@ database_name = "edgejump-db"
 database_id = "local-edgejump-db"
 migrations_dir = "migrations"
 
-[[r2_buckets]]
-binding = "RECORDINGS"
-bucket_name = "edgejump-recordings"
+# [可选] R2 对象存储桶（用于会话终端录像与审计回放；若不需要录像回放功能可保持注释）
+# [[r2_buckets]]
+# binding = "RECORDINGS"
+# bucket_name = "edgejump-recordings"
 
 [[kv_namespaces]]
 binding = "KV_CACHE"
