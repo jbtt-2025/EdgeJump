@@ -19,10 +19,12 @@ export const Login: React.FC = () => {
   const [recoveryCode, setRecoveryCode] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [deployType, setDeployType] = useState('production');
 
   useEffect(() => {
     api.getBootstrapStatus()
       .then((res) => {
+        if (res.deployType) setDeployType(res.deployType);
         if (res.bootstrapNeeded) {
           setBootstrapNeeded(true);
           setIsBootstrapMode(true);
@@ -84,6 +86,13 @@ export const Login: React.FC = () => {
             {isBootstrapMode ? '首次部署超级管理员初始化' : mfaRequired ? '双因子安全认证 (MFA)' : '统一身份认证'}
           </p>
         </div>
+
+        {deployType === 'demo' && (
+          <div className="mb-4 bg-amber-950/40 border border-amber-800/60 text-amber-300 px-3.5 py-2.5 rounded-lg text-xs leading-relaxed flex items-start space-x-2">
+            <span className="font-semibold px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-200 shrink-0 text-[11px]">演示模式</span>
+            <span>公开体验环境：管理员密码与录像保留时间已受保护锁定，其余功能均可自由体验。</span>
+          </div>
+        )}
 
         {error && (
           <div className="mb-6 bg-red-950/60 border border-red-800 text-red-300 px-4 py-3 rounded-lg text-sm flex items-start space-x-2">

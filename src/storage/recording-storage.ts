@@ -15,6 +15,7 @@ export interface StorageObject {
 export interface RecordingStorage {
   put(key: string, value: Uint8Array | string, options?: StoragePutOptions): Promise<void>;
   get(key: string): Promise<StorageObject | null>;
+  delete(key: string): Promise<void>;
 }
 
 /**
@@ -42,6 +43,10 @@ export class R2RecordingStorage implements RecordingStorage {
       text: () => obj.text(),
       arrayBuffer: () => obj.arrayBuffer(),
     };
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.bucket.delete(key);
   }
 }
 
@@ -119,6 +124,15 @@ export class S3RecordingStorage implements RecordingStorage {
       text: () => response.text(),
       arrayBuffer: () => response.arrayBuffer(),
     };
+  }
+
+  async delete(key: string): Promise<void> {
+    const url = this.getUrl(key);
+    const response = await this.client.fetch(url, { method: 'DELETE' });
+    if (!response.ok && response.status !== 404) {
+      const errText = await response.text().catch(() => '');
+      throw new Error(`S3 DELETE "${key}" failed (HTTP ${response.status}): ${errText}`);
+    }
   }
 }
 

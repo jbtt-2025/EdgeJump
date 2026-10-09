@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import { readFile, writeFile, unlink } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse, stringify } from 'smol-toml';
 import {
@@ -15,6 +17,44 @@ import {
 const root = fileURLToPath(new URL('../', import.meta.url));
 const generatedConfig = '.wrangler.generated.toml';
 const wrangler = fileURLToPath(new URL('../node_modules/wrangler/bin/wrangler.js', import.meta.url));
+
+function loadDotEnv(): boolean {
+  const envPath = resolve(root, '.env');
+  if (!existsSync(envPath)) return false;
+
+  if (typeof (process as any).loadEnvFile === 'function') {
+    try {
+      (process as any).loadEnvFile(envPath);
+      return true;
+    } catch {
+      // Fallback
+    }
+  }
+
+  try {
+    const text = readFileSync(envPath, 'utf8');
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eqIdx = line.indexOf('=');
+      if (eqIdx === -1) continue;
+      const key = line.slice(0, eqIdx).trim();
+      let val = line.slice(eqIdx + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1);
+      }
+      if (key && process.env[key] === undefined) {
+        process.env[key] = val;
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function maskSecret(val: string): void {
   if (process.env.GITHUB_ACTIONS === 'true' && val) {
@@ -58,13 +98,20 @@ async function runWrangler(args: string[], input?: string, configPath = generate
 }
 
 async function main(): Promise<void> {
+  const loaded = loadDotEnv();
+  if (loaded) {
+    console.log('✓ 已载入本地 .env 环境变量配置文件');
+  }
+
   const templatePath = new URL('../wrangler.toml', import.meta.url);
   const templateText = await readFile(templatePath, 'utf8');
   const template = parse(templateText) as any;
 
   const apiToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
   if (!apiToken) {
-    throw new Error('缺少环境变量 CLOUDFLARE_API_TOKEN。请配置具有 Workers、D1、KV 权限的 Cloudflare API 令牌。');
+    throw new Error(
+      '缺少环境变量 CLOUDFLARE_API_TOKEN。请复制 .env.example 为 .env 并填入令牌，或在环境变量中设置。'
+    );
   }
 
   const workerName = process.env.WORKER_NAME?.trim() || String(template.name || 'edgejump');
@@ -149,12 +196,19 @@ async function main(): Promise<void> {
   await runCommand('npm', ['run', 'build:web']);
   console.log('✓ 前端构建完成。');
 
+  const deployType = process.env.DEPLOY_TYPE?.trim() || template.vars?.DEPLOY_TYPE || 'production';
+  console.log(`✓ 部署模式: ${deployType === 'demo' ? '演示站模式 (Demo Mode)' : '正式模式 (Production)'}`);
+
   // 6. 生成临时部署配置文件 (避免硬编码生产 UUID 污染 Git)
   const generatedConfigObj = {
     ...template,
     name: workerName,
     account_id: accountId,
     workers_dev: !customDomain,
+    vars: {
+      ...(template.vars || {}),
+      DEPLOY_TYPE: deployType,
+    },
     ...(customDomain ? { routes: [{ pattern: customDomain, custom_domain: true }] } : {}),
     d1_databases: ((template.d1_databases as any[]) || []).map((b) =>
       b.binding === 'DB' ? { ...b, database_name: database.name, database_id: database.uuid } : b

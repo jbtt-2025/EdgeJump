@@ -70,6 +70,36 @@ import { getAllSettings, updateSetting } from '../settings/settings-service.ts';
 import { listAuditEvents } from '../audit/audit-service.ts';
 import { hasPermission, Permissions } from '../rbac/permissions.ts';
 import { getRecordingStorage } from '../storage/recording-storage.ts';
+import { cleanupExpiredRecordings } from '../sessions/cleanup-service.ts';
+
+export function isDemoMode(env: Env): boolean {
+  return env.DEPLOY_TYPE?.toLowerCase() === 'demo';
+}
+
+async function isUserAdministrator(userId: string, db: D1Database): Promise<boolean> {
+  const user = await db
+    .prepare('SELECT username FROM users WHERE id = ?')
+    .bind(userId)
+    .first<{ username: string }>();
+  if (user?.username === 'admin') return true;
+
+  const roles = await db
+    .prepare(
+      `SELECT r.name
+       FROM roles r
+       JOIN user_roles ur ON r.id = ur.role_id
+       WHERE ur.user_id = ?`
+    )
+    .bind(userId)
+    .all<{ name: string }>();
+
+  return (roles.results || []).some(
+    (r) =>
+      r.name.toLowerCase().includes('admin') ||
+      r.name === 'Super Admin' ||
+      r.name === 'Asset Admin'
+  );
+}
 
 function extractSessionToken(request: Request): string | null {
   const cookieHeader = request.headers.get('Cookie');
@@ -133,7 +163,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
   // Check if bootstrap is needed
   if (path === '/api/auth/bootstrap/status' && method === 'GET') {
     const needed = await isBootstrapNeeded(env.DB);
-    return jsonResponse({ bootstrapNeeded: needed });
+    return jsonResponse({ bootstrapNeeded: needed, deployType: env.DEPLOY_TYPE || 'production' });
   }
 
   // --- 2. AUTHENTICATION (LOGIN, LOGOUT) ---
@@ -241,6 +271,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
         roles: currentUser.roles,
       },
       permissions: Array.from(currentUser.permissions),
+      deployType: env.DEPLOY_TYPE || 'production',
     });
   }
 
@@ -356,6 +387,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       if (!hasPermission(currentUser.permissions, Permissions.USER_DISABLE)) {
         return jsonError('Permission denied', 403);
       }
+      if (isDemoMode(env) && (await isUserAdministrator(targetUserId, env.DB))) {
+        return jsonError('演示模式下禁止禁用管理员账号', 403);
+      }
       await disableUser(targetUserId, currentUser.id, env);
       return jsonResponse({ success: true });
     }
@@ -371,6 +405,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     if (subAction === 'reset-password' && method === 'POST') {
       if (!hasPermission(currentUser.permissions, Permissions.USER_UPDATE)) {
         return jsonError('Permission denied', 403);
+      }
+      if (isDemoMode(env) && (await isUserAdministrator(targetUserId, env.DB))) {
+        return jsonError('演示模式下禁止修改管理员密码', 403);
       }
       const body = await request.json<any>();
       await resetUserPassword(targetUserId, body.password, currentUser.id, env);
@@ -708,8 +745,23 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     if (typeof body.key !== 'string' || typeof body.value !== 'string') {
       return jsonError('key and value strings are required', 400);
     }
+    if (isDemoMode(env) && body.key === 'recording_retention_days') {
+      return jsonError('演示模式下禁止修改录像保留时间', 403);
+    }
     await updateSetting(body.key, body.value, currentUser.id, env.DB);
     return jsonResponse({ success: true });
+  }
+
+  // Admin Manual Recording Retention Cleanup Trigger
+  if (path === '/api/admin/recordings/cleanup' && method === 'POST') {
+    if (
+      !hasPermission(currentUser.permissions, Permissions.SETTINGS_WRITE) &&
+      !hasPermission(currentUser.permissions, Permissions.AUDIT_READ)
+    ) {
+      return jsonError('Permission denied', 403);
+    }
+    const result = await cleanupExpiredRecordings(env, 'manual');
+    return jsonResponse(result);
   }
 
   // Admin Audit Log Viewer

@@ -4,6 +4,8 @@ import { RateLimitDO } from './durable/RateLimitDO.ts';
 import { handleApiRequest } from './api/router.ts';
 import { isProductionHttp, httpsRedirect, secureHeaders } from './http-security.ts';
 
+import { cleanupExpiredRecordings } from './sessions/cleanup-service.ts';
+
 // Export Durable Objects required by wrangler.toml
 export { SSHSessionDO, RateLimitDO };
 
@@ -27,6 +29,7 @@ export default {
           service: 'EdgeJump Bastion',
           runtime: 'cloudflare-workers',
           version: '1.0.0',
+          deployType: env.DEPLOY_TYPE || 'production',
         })
       );
     }
@@ -45,5 +48,9 @@ export default {
     return new Response('EdgeJump Bastion Worker Ready', {
       headers: { 'Content-Type': 'text/plain' },
     });
+  },
+
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(cleanupExpiredRecordings(env, 'cron'));
   },
 };

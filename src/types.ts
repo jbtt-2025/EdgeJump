@@ -22,6 +22,7 @@ export interface Env {
   // Vars
   CONNECT_TIMEOUT_MS?: string;
   ENVIRONMENT?: string;
+  DEPLOY_TYPE?: 'production' | 'demo' | string;
 }
 
 export type UserStatus = 'active' | 'disabled' | 'locked';

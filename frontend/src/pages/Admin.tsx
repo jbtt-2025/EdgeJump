@@ -1,14 +1,17 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api/client';
-import { Server, FolderTree, Key, ShieldCheck, Plus, Trash2, Edit2, RefreshCw, Check } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+import { Server, FolderTree, Key, ShieldCheck, Plus, Trash2, Edit2, RefreshCw, Check, Settings as SettingsIcon, Lock } from 'lucide-react';
 
 export const Admin: React.FC = () => {
-  const [tab, setTab] = useState<'assets' | 'groups' | 'credentials' | 'authorizations' | 'users'>('assets');
+  const { deployType } = useAuth();
+  const [tab, setTab] = useState<'assets' | 'groups' | 'credentials' | 'authorizations' | 'users' | 'settings'>('assets');
   const [assets, setAssets] = useState<any[]>([]);
   const [groups, setGroups] = useState<any[]>([]);
   const [credentials, setCredentials] = useState<any[]>([]);
   const [authorizations, setAuthorizations] = useState<any[]>([]);
   const [users, setUsers] = useState<any[]>([]);
+  const [settings, setSettings] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -24,6 +27,10 @@ export const Admin: React.FC = () => {
 
   const [showUserModal, setShowUserModal] = useState(false);
   const [userForm, setUserForm] = useState({ username: '', password: '', displayName: '', role: 'User' });
+
+  const [showResetPasswordModal, setShowResetPasswordModal] = useState(false);
+  const [targetUser, setTargetUser] = useState<any>(null);
+  const [newPassword, setNewPassword] = useState('');
 
   const loadData = async () => {
     setLoading(true);
@@ -42,6 +49,9 @@ export const Admin: React.FC = () => {
         setAssets(a);
       } else if (tab === 'users') {
         setUsers(await api.listUsers());
+      } else if (tab === 'settings') {
+        const s = await api.getSettings();
+        setSettings(s);
       }
     } catch (err: any) {
       setMessage(`加载错误: ${err.message}`);
@@ -131,6 +141,14 @@ export const Admin: React.FC = () => {
               }`}
             >
               用户与RBAC角色
+            </button>
+            <button
+              onClick={() => setTab('settings')}
+              className={`px-3 py-1 text-xs font-medium rounded-md transition ${
+                tab === 'settings' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              系统策略设置
             </button>
           </div>
         </div>
@@ -492,10 +510,31 @@ export const Admin: React.FC = () => {
                         {u.status === 'active' ? '启用中' : '已禁用'}
                       </span>
                     </td>
-                    <td className="px-4 py-3 text-right">
+                    <td className="px-4 py-3 text-right space-x-2">
+                      <button
+                        onClick={() => {
+                          const isAdmin = u.username === 'admin' || (u.roles || []).some((r: string) => r.toLowerCase().includes('admin') || r === 'Super Admin');
+                          if (deployType === 'demo' && isAdmin) {
+                            alert('演示模式下禁止修改管理员密码！');
+                            return;
+                          }
+                          setTargetUser(u);
+                          setNewPassword('');
+                          setShowResetPasswordModal(true);
+                        }}
+                        className="px-2 py-1 bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 rounded text-[11px] transition"
+                        title={deployType === 'demo' && (u.username === 'admin' || (u.roles || []).some((r: string) => r.toLowerCase().includes('admin') || r === 'Super Admin')) ? '演示模式已锁定' : '重置此用户密码'}
+                      >
+                        重置密码
+                      </button>
                       {u.status === 'active' ? (
                         <button
                           onClick={async () => {
+                            const isAdmin = u.username === 'admin' || (u.roles || []).some((r: string) => r.toLowerCase().includes('admin') || r === 'Super Admin');
+                            if (deployType === 'demo' && isAdmin) {
+                              alert('演示模式下禁止禁用管理员账号！');
+                              return;
+                            }
                             if (confirm(`确认禁用用户 ${u.username}？将立即断开其登录及在线SSH会话。`)) {
                               await api.disableUser(u.id);
                               loadData();
@@ -521,6 +560,144 @@ export const Admin: React.FC = () => {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+
+        {tab === 'settings' && (
+          <div className="bg-slate-800 border border-slate-700 rounded-xl overflow-hidden shadow-sm p-6 space-y-6">
+            <div>
+              <h2 className="text-base font-bold text-white flex items-center space-x-2">
+                <SettingsIcon className="w-5 h-5 text-blue-400" />
+                <span>系统策略与生命周期设置</span>
+              </h2>
+              <p className="text-slate-400 text-xs mt-1">
+                管理全局会话超时、MFA 要求以及审计录像在对象存储中的自动清理保留期。
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+              <div className="space-y-4">
+                <div className="bg-slate-900/60 border border-slate-700/60 rounded-lg p-4">
+                  <label className="block text-xs font-semibold text-slate-300 uppercase mb-1">
+                    会话空闲超时 (session_idle_timeout)
+                  </label>
+                  <p className="text-slate-500 text-[11px] mb-2">单位：秒。默认 1800 秒 (30 分钟)。无操作超时自动断开。</p>
+                  <div className="flex items-center space-x-2">
+                    <input
+                      type="number"
+                      value={settings.session_idle_timeout || '1800'}
+                      onChange={(e) => setSettings({ ...settings, session_idle_timeout: e.target.value })}
+                      className="bg-slate-900 border border-slate-700 rounded px-3 py-1.5 text-xs text-white w-32 focus:outline-none focus:border-blue-500 font-mono"
+                    />
+                    <button
+                      onClick={async () => {
+                        try {
+                          await api.updateSetting('session_idle_timeout', settings.session_idle_timeout);
+                          alert('空闲超时设置已更新！');
+                        } catch (err: any) {
+                          alert(err.message);
+                        }
+                      }}
+                      className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded transition"
+                    >
+                      更新
+                    </button>
+                  </div>
+                </div>
+
+                <div className="bg-slate-900/60 border border-slate-700/60 rounded-lg p-4">
+                  <label className="block text-xs font-semibold text-slate-300 uppercase mb-1">
+                    会话最大持续时间 (session_max_duration)
+                  </label>
+                  <p className="text-slate-500 text-[11px] mb-2">单位：秒。默认 28800 秒 (8 小时)。达到最大生命周期强制切断。</p>
+                  <div className="flex items-center space-x-2">
+                    <input
+                      type="number"
+                      value={settings.session_max_duration || '28800'}
+                      onChange={(e) => setSettings({ ...settings, session_max_duration: e.target.value })}
+                      className="bg-slate-900 border border-slate-700 rounded px-3 py-1.5 text-xs text-white w-32 focus:outline-none focus:border-blue-500 font-mono"
+                    />
+                    <button
+                      onClick={async () => {
+                        try {
+                          await api.updateSetting('session_max_duration', settings.session_max_duration);
+                          alert('最大持续时间设置已更新！');
+                        } catch (err: any) {
+                          alert(err.message);
+                        }
+                      }}
+                      className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded transition"
+                    >
+                      更新
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <div className="bg-slate-900/60 border border-slate-700/60 rounded-lg p-4">
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs font-semibold text-slate-300 uppercase">
+                      操作回放 (R2/S3) 保留时间 (recording_retention_days)
+                    </label>
+                    {deployType === 'demo' && (
+                      <span className="text-[10px] text-amber-300 bg-amber-900/40 border border-amber-700/40 px-2 py-0.5 rounded">
+                        演示模式已锁定
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-slate-500 text-[11px] mb-2">
+                    单位：天。默认 7 天。超出保留期的会话录像文件由每日定时 Cron 自动清理，并同步将数据库状态标记为已过期。
+                  </p>
+                  <div className="flex items-center space-x-2">
+                    <input
+                      type="number"
+                      disabled={deployType === 'demo'}
+                      value={settings.recording_retention_days || '7'}
+                      onChange={(e) => setSettings({ ...settings, recording_retention_days: e.target.value })}
+                      className="bg-slate-900 border border-slate-700 rounded px-3 py-1.5 text-xs text-white w-32 focus:outline-none focus:border-blue-500 font-mono disabled:opacity-50"
+                    />
+                    <button
+                      disabled={deployType === 'demo'}
+                      onClick={async () => {
+                        try {
+                          await api.updateSetting('recording_retention_days', settings.recording_retention_days);
+                          alert('录像保留时间已更新！');
+                        } catch (err: any) {
+                          alert(err.message);
+                        }
+                      }}
+                      className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded transition disabled:opacity-50 disabled:hover:bg-blue-600"
+                    >
+                      更新
+                    </button>
+                  </div>
+                </div>
+
+                <div className="bg-slate-900/60 border border-slate-700/60 rounded-lg p-4">
+                  <label className="block text-xs font-semibold text-slate-300 uppercase mb-1">
+                    录像生命周期手动执行
+                  </label>
+                  <p className="text-slate-500 text-[11px] mb-3">
+                    系统内置每天 UTC 03:00 定时执行生命周期清理。你也可以立即手动执行一次清理扫描。
+                  </p>
+                  <button
+                    onClick={async () => {
+                      try {
+                        const res = await api.cleanupExpiredRecordings();
+                        alert(`清理完成！共清理 ${res.cleanedCount} 个已过期录像会话（设定保留天数: ${res.retentionDays} 天）。`);
+                      } catch (err: any) {
+                        alert(`清理失败: ${err.message}`);
+                      }
+                    }}
+                    className="flex items-center space-x-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-slate-200 text-xs font-medium rounded transition"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>立即执行录像清理</span>
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
@@ -592,6 +769,48 @@ export const Admin: React.FC = () => {
               <div className="flex items-center justify-end space-x-2 pt-2">
                 <button type="button" onClick={() => setShowUserModal(false)} className="px-4 py-2 bg-slate-700 text-slate-300 text-xs rounded-lg">取消</button>
                 <button type="submit" className="px-4 py-2 bg-blue-600 text-white text-xs font-medium rounded-lg">创建用户</button>
+              </div>
+            </form>
+          </div>
+        )}
+
+        {showResetPasswordModal && targetUser && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              try {
+                await api.resetUserPassword(targetUser.id, newPassword);
+                alert(`用户 ${targetUser.username} 的密码重置成功！原登录会话已全部注销。`);
+                setShowResetPasswordModal(false);
+                setNewPassword('');
+                setTargetUser(null);
+                loadData();
+              } catch (err: any) {
+                alert(err.message);
+              }
+            }} className="bg-slate-800 border border-slate-700 rounded-xl max-w-sm w-full p-6 space-y-4 shadow-xl">
+              <h3 className="text-base font-bold text-white flex items-center space-x-2">
+                <Lock className="w-4 h-4 text-blue-400" />
+                <span>重置用户密码</span>
+              </h3>
+              <p className="text-xs text-slate-400">
+                正在为用户 <span className="text-white font-mono font-medium">{targetUser.username}</span> 设置新密码。重置后该用户的已有登录 Session 将全部失效。
+              </p>
+              <div>
+                <label className="block text-xs font-semibold text-slate-300 uppercase mb-1">新密码 (至少 8 位)</label>
+                <input
+                  type="password"
+                  required
+                  minLength={8}
+                  placeholder="••••••••"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500 font-mono"
+                />
+              </div>
+              <div className="flex items-center justify-end space-x-2 pt-2">
+                <button type="button" onClick={() => { setShowResetPasswordModal(false); setTargetUser(null); }} className="px-4 py-2 bg-slate-700 text-slate-300 text-xs rounded-lg">取消</button>
+                <button type="submit" className="px-4 py-2 bg-blue-600 text-white text-xs font-medium rounded-lg">确认重置</button>
               </div>
             </form>
           </div>

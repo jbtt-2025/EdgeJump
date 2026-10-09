@@ -37,11 +37,11 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 export const api = {
   // Auth
-  getBootstrapStatus: () => request<{ bootstrapNeeded: boolean }>('/api/auth/bootstrap/status'),
+  getBootstrapStatus: () => request<{ bootstrapNeeded: boolean; deployType?: string }>('/api/auth/bootstrap/status'),
   bootstrap: (data: any) => request('/api/auth/bootstrap', { method: 'POST', body: JSON.stringify(data) }),
-  login: (data: any) => request<{ mfaRequired: boolean; user?: any; permissions?: string[] }>('/api/auth/login', { method: 'POST', body: JSON.stringify(data) }),
+  login: (data: any) => request<{ mfaRequired: boolean; user?: any; permissions?: string[]; deployType?: string }>('/api/auth/login', { method: 'POST', body: JSON.stringify(data) }),
   logout: () => request('/api/auth/logout', { method: 'POST' }),
-  getMe: () => request<{ user: any; permissions: string[] }>('/api/me'),
+  getMe: () => request<{ user: any; permissions: string[]; deployType?: string }>('/api/me'),
 
   // Assets (User Visible)
   getVisibleAssets: () => request<any[]>('/api/assets'),
@@ -97,6 +97,7 @@ export const api = {
   // Settings
   getSettings: () => request<Record<string, string>>('/api/admin/settings'),
   updateSetting: (key: string, value: string) => request('/api/admin/settings', { method: 'PATCH', body: JSON.stringify({ key, value }) }),
+  cleanupExpiredRecordings: () => request<{ cleanedCount: number; expiredSessionIds: string[]; retentionDays: number }>('/api/admin/recordings/cleanup', { method: 'POST' }),
 
   // Admin Sessions & Audit
   listOnlineSessions: () => request<any[]>('/api/admin/sessions?type=online'),

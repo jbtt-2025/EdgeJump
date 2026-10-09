@@ -9,6 +9,7 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   terminate_active_sessions_on_disable: 'true',
   terminate_sessions_on_permission_revocation: 'false',
   require_mfa_for_all: 'false',
+  recording_retention_days: '7', // 7 days retention for audit recordings
 };
 
 /**

@@ -8,7 +8,7 @@ interface NavbarProps {
 }
 
 export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
-  const { user, logout, hasPermission } = useAuth();
+  const { user, logout, hasPermission, deployType } = useAuth();
 
   if (!user) return null;
 
@@ -18,6 +18,11 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
         <div className="flex items-center space-x-2 text-blue-400 font-bold text-lg cursor-pointer" onClick={() => onSelectTab('dashboard')}>
           <Shield className="w-6 h-6" />
           <span>EdgeJump</span>
+          {deployType === 'demo' && (
+            <span className="ml-1 text-xs font-normal px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/30 tracking-normal">
+              演示模式
+            </span>
+          )}
         </div>
 
         <nav className="flex items-center space-x-2">

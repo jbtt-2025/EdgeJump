@@ -41,9 +41,15 @@
 * **全量终端录像回放（可选功能，支持 R2 / S3 / Backblaze B2）**：
   * **原生 R2 存储**：配置 Cloudflare R2 绑定后，会话事件流（stdout、resize、时间戳）自动流式分块压缩上传，内置回放器支持变速播放与拖拽，分块支持 SHA-256 哈希链防篡改。
   * **S3 / Backblaze B2 兼容存储（免绑卡免费推荐）**：无需开通 R2 也无需绑定信用卡，仅需配置 Backblaze B2 或任意 S3 兼容存储的环境变量，即可直接获得全量录像与回放能力！
+  * **生命周期自动清理**：系统内置 `recording_retention_days`（默认 7 天），通过 Cloudflare Workers 原生 Cron 触发器每日定时自动扫描并物理清理过期录像文件，防止占用对象存储配额；同时兼容云存储端原生 Lifecycle 规则。
   * **未配置存储时**：系统自动跳过录像写入，**不保存审计录像回放**，列表状态显示为“未录像”；堡垒机所有连接、授权、监控与审计日志等核心功能完全正常运行。
 
-### 6. 边缘原生高可用与防爆破防护
+### 6. 演示站模式 (Demo Mode)
+系统支持通过 `DEPLOY_TYPE=demo` 环境变量一键启用公开演示站模式：
+* **核心资产与密码保护**：在演示模式下，**禁止修改管理员密码**，**禁止禁用管理员账号**，**禁止修改录像保留时间**，有效防止公共体验用户破坏环境。
+* **全功能无门槛体验**：除管理员密码与保留时间锁定外，普通用户管理、主机资产纳管、SSH 账号授权、终端连接、lrzsz 文件上传与下载、实时监视等其余所有核心功能均完全开放体验。
+
+### 7. 边缘原生高可用与防爆破防护
 * **Durable Object 会话隔离**：每个 SSH Session 分配专属 DO 实例，独立管理 TCP 链路、PTY 状态与心跳保活。
 * **防暴力破解**：内置 RateLimitDO 状态机，对登录尝试、MFA 验证与密码重置施加速度限制与 IP 锁定。
 
@@ -104,6 +110,7 @@ Fork 或推送到你自己的 GitHub 仓库后，进入项目仓库页面：
 | `CLOUDFLARE_API_TOKEN` | **是** | 具备 Workers、D1、KV 权限的 Cloudflare API 令牌 |
 | `CLOUDFLARE_ACCOUNT_ID` | 推荐 | Cloudflare 账户 ID（多账号或精简权限 Token 必填，单账号可自动解析） |
 | `BOOTSTRAP_TOKEN` | 否 | 首次初始化超级管理员的 Token（若不填，脚本自动生成并在 Actions 摘要中展示） |
+| `DEPLOY_TYPE` | 否 | 部署模式：`production` (默认正式模式) 或 `demo` (演示站模式，锁定管理员密码及录像保留期) |
 
 #### 可选：Backblaze B2 / 兼容 S3 录像存储（免信用卡录像方案）
 若想开启录像回放但不想在 Cloudflare 绑卡，可在 Actions **Secrets** 中添加：
@@ -147,34 +154,50 @@ cd jump_server_worker
 npm install
 ```
 
-### 步骤 2：执行一键部署
+### 步骤 2：配置本地环境变量文件 (`.env`)
 
-设置你的 Cloudflare API 令牌后，直接运行部署脚本：
+复制项目根目录下的 `.env.example` 模版为 `.env`：
 
 ```bash
 # Linux / macOS
-export CLOUDFLARE_API_TOKEN="你的_CLOUDFLARE_API_TOKEN"
-# 可选：指定账户 ID (多账号环境推荐)
-# export CLOUDFLARE_ACCOUNT_ID="你的_ACCOUNT_ID"
-# 可选：配置 Backblaze B2 免绑卡录像存储
-# export S3_ENDPOINT="https://s3.us-west-004.backblazeb2.com"
-# export S3_BUCKET="edgejump-recordings"
-# export S3_ACCESS_KEY_ID="004..."
-# export S3_SECRET_ACCESS_KEY="K004..."
-npm run deploy
+cp .env.example .env
 
 # Windows PowerShell
-$env:CLOUDFLARE_API_TOKEN = "你的_CLOUDFLARE_API_TOKEN"
-# $env:CLOUDFLARE_ACCOUNT_ID = "你的_ACCOUNT_ID"
+copy .env.example .env
+```
+
+打开 `.env` 文件，填入你的 `CLOUDFLARE_API_TOKEN`（以及可选的 `CLOUDFLARE_ACCOUNT_ID`、`DEPLOY_TYPE` 或 S3 存储参数等）：
+
+```env
+CLOUDFLARE_API_TOKEN=你的_CLOUDFLARE_API_TOKEN
+# 可选：指定账户 ID (多账号环境推荐)
+# CLOUDFLARE_ACCOUNT_ID=你的_ACCOUNT_ID
+# 可选：部署模式 (默认为 production，如需公开体验站可设为 demo)
+# DEPLOY_TYPE=demo
+# 可选：配置 Backblaze B2 免绑卡录像存储
+# S3_ENDPOINT=https://s3.us-west-004.backblazeb2.com
+# S3_BUCKET=edgejump-recordings
+# S3_ACCESS_KEY_ID=004...
+# S3_SECRET_ACCESS_KEY=K004...
+```
+
+> **提示**：`.env` 已在 `.gitignore` 中默认排除，不会意外提交到 Git 代码库。
+
+### 步骤 3：执行一键部署
+
+直接运行部署脚本（脚本将自动载入 `.env`）：
+
+```bash
 npm run deploy
 ```
 
 部署脚本会自动连接 Cloudflare 执行：
-1. 解析账户并自动定位或创建 D1 `edgejump-db`；
-2. 自动定位或创建 KV `edgejump-kv`；
-3. 自动生成加解密主密钥并通过管道（`wrangler secret bulk`）安全存入 Worker；
-4. 编译前端单页应用并应用 D1 迁移；
-5. 完成 Worker 发布，并在终端末尾打印访问域名与 `BOOTSTRAP_TOKEN`。
+1. 自动载入 `.env` 环境变量并校验配置；
+2. 解析账户并自动定位或创建 D1 `edgejump-db`；
+3. 自动定位或创建 KV `edgejump-kv`；
+4. 自动生成加解密主密钥并通过管道（`wrangler secret bulk`）安全存入 Worker；
+5. 编译前端单页应用并应用 D1 远端数据库迁移；
+6. 完成 Worker 发布，并在终端末尾打印访问域名与 `BOOTSTRAP_TOKEN`。
 
 ---
 
