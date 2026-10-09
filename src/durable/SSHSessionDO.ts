@@ -64,6 +64,7 @@ import {
 } from '../ssh/types.ts';
 import { SessionRecorder } from './recording.ts';
 import { CommandHeuristicsTracker } from './heuristics.ts';
+import { getRecordingStorage } from '../storage/recording-storage.ts';
 
 export interface TCPSocket {
   readable: ReadableStream<Uint8Array>;
@@ -260,7 +261,8 @@ export class SSHSessionDO {
     this.sessionId = config.sessionId || (this.state?.id ? this.state.id.toString() : crypto.randomUUID());
     this.status = 'connecting';
 
-    this.recorder = new SessionRecorder(this.sessionId, this.env?.RECORDINGS);
+    const storage = getRecordingStorage(this.env);
+    this.recorder = new SessionRecorder(this.sessionId, storage);
     this.heuristics = new CommandHeuristicsTracker(this.sessionId, this.env?.DB);
 
     // Initial record in D1 ssh_sessions
@@ -1004,10 +1006,11 @@ export class SSHSessionDO {
       // Ignored
     }
 
-    // 3. Flush Recording and save manifest to R2 (if R2 is configured)
+    // 3. Flush Recording and save manifest to R2 / S3 / B2 (if storage configured)
     let recordingHash: string | null = null;
     let recordingPath: string | null = null;
-    if (this.recorder && this.env?.RECORDINGS) {
+    const storage = getRecordingStorage(this.env);
+    if (this.recorder && storage) {
       try {
         const manifest = await this.recorder.close(reason);
         recordingHash = manifest.finalHash;
@@ -1092,7 +1095,8 @@ export class SSHSessionDO {
     if (!this.env?.DB) return;
 
     const endedAt = Date.now();
-    const recordingStatus = (this.env?.RECORDINGS && recordingPath) ? 'completed' : 'none';
+    const storage = getRecordingStorage(this.env);
+    const recordingStatus = (storage && recordingPath) ? 'completed' : 'none';
     await this.env.DB.prepare(
       `UPDATE ssh_sessions SET
          status = ?,

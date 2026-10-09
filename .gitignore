@@ -5,6 +5,8 @@ node_modules/
 # Build outputs
 dist/
 .wrangler/
+*.generated.toml
+.wrangler.generated.toml
 
 # Environment and secrets
 .env

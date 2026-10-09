@@ -8,6 +8,7 @@ import { checkUserAssetAccountAccess } from '../authorization/authorization-serv
 import { getDecryptedCredential } from '../credentials/credential-service.ts';
 import { createTicket } from '../backend/security.ts';
 import { recordAuditEvent } from '../audit/audit-service.ts';
+import { getRecordingStorage } from '../storage/recording-storage.ts';
 
 export interface CreateSessionOptions {
   userId: string;
@@ -429,13 +430,14 @@ export async function getSessionRecording(
   const session = await getSessionDetail(sessionId, env.DB);
   if (!session) return null;
 
-  if (!env.RECORDINGS || !session.recording_path || session.recording_status === 'none') {
+  const storage = getRecordingStorage(env);
+  if (!storage || !session.recording_path || session.recording_status === 'none') {
     return null;
   }
 
   const prefix = session.recording_path;
 
-  const manifestObj = await env.RECORDINGS.get(`${prefix}/manifest.json`);
+  const manifestObj = await storage.get(`${prefix}/manifest.json`);
   let manifest = null;
   if (manifestObj) {
     try {

@@ -126,10 +126,20 @@ export async function computeRollingHash(
   return bytesToHex(new Uint8Array(digest));
 }
 
+import { type RecordingStorage, R2RecordingStorage } from '../storage/recording-storage.ts';
+
+function toRecordingStorage(target?: RecordingStorage | R2Bucket | null): RecordingStorage | null {
+  if (!target) return null;
+  if ('get' in target && 'put' in target && typeof (target as any).get === 'function') {
+    return target as RecordingStorage;
+  }
+  return new R2RecordingStorage(target as R2Bucket);
+}
+
 export class SessionRecorder {
   private readonly sessionId: string;
   private readonly startedAt: number;
-  private readonly r2Bucket?: R2Bucket;
+  private readonly storage?: RecordingStorage | null;
   private readonly recordingPrefix: string;
 
   private eventsBuffer: TerminalEvent[] = [];
@@ -144,9 +154,9 @@ export class SessionRecorder {
   readonly maxChunkBytes: number = 512 * 1024; // 512 KiB threshold
   readonly flushIntervalMs: number = 15_000;   // 15 seconds threshold
 
-  constructor(sessionId: string, r2Bucket?: R2Bucket, startedAt: number = Date.now()) {
+  constructor(sessionId: string, storage?: RecordingStorage | R2Bucket | null, startedAt: number = Date.now()) {
     this.sessionId = sessionId;
-    this.r2Bucket = r2Bucket;
+    this.storage = toRecordingStorage(storage);
     this.startedAt = startedAt;
 
     const date = new Date(startedAt);
@@ -155,7 +165,7 @@ export class SessionRecorder {
     const dd = String(date.getUTCDate()).padStart(2, '0');
     this.recordingPrefix = `recordings/${yyyy}/${mm}/${dd}/${sessionId}`;
 
-    if (this.r2Bucket) {
+    if (this.storage) {
       this.startPeriodicFlush();
     }
   }
@@ -197,7 +207,7 @@ export class SessionRecorder {
   }
 
   recordEvent(type: TerminalEventType, data?: unknown, extra?: Partial<TerminalEvent>): void {
-    if (this.isClosed || !this.r2Bucket) return;
+    if (this.isClosed || !this.storage) return;
 
     this.seqNum++;
     const t = Math.max(0, Date.now() - this.startedAt);
@@ -226,7 +236,7 @@ export class SessionRecorder {
   }
 
   async flushChunk(): Promise<ChunkFlushResult | null> {
-    if (this.eventsBuffer.length === 0 || !this.r2Bucket) {
+    if (this.eventsBuffer.length === 0 || !this.storage) {
       return null;
     }
 
@@ -255,11 +265,9 @@ export class SessionRecorder {
     const paddedSeq = String(this.chunkCount).padStart(6, '0');
     const chunkPath = `${this.recordingPrefix}/chunk-${paddedSeq}.jsonl.gz`;
 
-    if (this.r2Bucket) {
-      await this.r2Bucket.put(chunkPath, compressedGzip, {
-        httpMetadata: {
-          contentType: 'application/gzip',
-        },
+    if (this.storage) {
+      await this.storage.put(chunkPath, compressedGzip, {
+        contentType: 'application/gzip',
         customMetadata: {
           sessionId: this.sessionId,
           chunkIndex: String(this.chunkCount),
@@ -288,11 +296,11 @@ export class SessionRecorder {
         finalHash: this.rollingHash,
         startedAt: this.startedAt,
         endedAt: Date.now(),
-        recordingPath: this.r2Bucket ? this.recordingPrefix : '',
+        recordingPath: this.storage ? this.recordingPrefix : '',
       };
     }
 
-    if (!this.r2Bucket) {
+    if (!this.storage) {
       this.isClosed = true;
       this.stopPeriodicFlush();
       return {
@@ -326,13 +334,11 @@ export class SessionRecorder {
       recordingPath: this.recordingPrefix,
     };
 
-    if (this.r2Bucket) {
+    if (this.storage) {
       const manifestPath = `${this.recordingPrefix}/manifest.json`;
       const manifestJson = JSON.stringify(manifest, null, 2);
-      await this.r2Bucket.put(manifestPath, manifestJson, {
-        httpMetadata: {
-          contentType: 'application/json',
-        },
+      await this.storage.put(manifestPath, manifestJson, {
+        contentType: 'application/json',
         customMetadata: {
           sessionId: this.sessionId,
           finalHash: this.rollingHash || '',

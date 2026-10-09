@@ -69,6 +69,7 @@ import {
 import { getAllSettings, updateSetting } from '../settings/settings-service.ts';
 import { listAuditEvents } from '../audit/audit-service.ts';
 import { hasPermission, Permissions } from '../rbac/permissions.ts';
+import { getRecordingStorage } from '../storage/recording-storage.ts';
 
 function extractSessionToken(request: Request): string | null {
   const cookieHeader = request.headers.get('Cookie');
@@ -680,8 +681,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       ) {
         return jsonError('Permission denied', 403);
       }
-      if (!env.RECORDINGS) {
-        return jsonError('Session recording replay is not available (R2 storage is optional and not configured)', 404);
+      const storage = getRecordingStorage(env);
+      if (!storage) {
+        return jsonError('Session recording replay is not available (Neither R2 nor S3/B2 storage is configured)', 404);
       }
       const recording = await getSessionRecording(sessionId, env);
       if (!recording) return jsonError('Recording not found', 404);

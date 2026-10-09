@@ -16,6 +16,11 @@ import {
 import { CommandHeuristicsTracker } from '../src/durable/heuristics.ts';
 import { RateLimitDO } from '../src/durable/RateLimitDO.ts';
 import { SSHSessionDO } from '../src/durable/SSHSessionDO.ts';
+import {
+  getRecordingStorage,
+  R2RecordingStorage,
+  S3RecordingStorage,
+} from '../src/storage/recording-storage.ts';
 
 test('recording: WebStreams CompressionStream(gzip) compresses and decompressGzip restores exact content', async () => {
   const events: TerminalEvent[] = [
@@ -164,6 +169,33 @@ test('recording: SessionRecorder operates gracefully as a no-op when R2 is omitt
   assert.equal(manifest.firstChunkHash, null);
   assert.equal(manifest.finalHash, null);
   assert.equal(manifest.recordingPath, '');
+});
+
+test('storage: getRecordingStorage selects R2, S3/B2, or null based on env bindings', () => {
+  // 1. Neither configured -> null
+  assert.equal(getRecordingStorage({} as any), null);
+
+  // 2. R2 configured
+  const mockR2 = { put: async () => {}, get: async () => null };
+  const r2Storage = getRecordingStorage({ RECORDINGS: mockR2 as any } as any);
+  assert.ok(r2Storage instanceof R2RecordingStorage);
+
+  // 3. Backblaze B2 / Generic S3 configured
+  const s3Storage = getRecordingStorage({
+    S3_ENDPOINT: 'https://s3.us-west-004.backblazeb2.com',
+    S3_BUCKET: 'b2-test-bucket',
+    S3_ACCESS_KEY_ID: '004abc123',
+    S3_SECRET_ACCESS_KEY: 'K004def456',
+  } as any);
+  assert.ok(s3Storage instanceof S3RecordingStorage);
+
+  // 4. Missing one of S3 fields -> null
+  const incompleteS3 = getRecordingStorage({
+    S3_ENDPOINT: 'https://s3.us-west-004.backblazeb2.com',
+    S3_BUCKET: 'b2-test-bucket',
+    // missing access keys
+  } as any);
+  assert.equal(incompleteS3, null);
 });
 
 test('heuristics: command line reconstruction across Enter, Backspace, Ctrl+C, Ctrl+U', () => {

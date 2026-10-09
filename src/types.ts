@@ -6,6 +6,13 @@ export interface Env {
   KV_CACHE: KVNamespace;
   ASSETS?: Fetcher;
 
+  // S3 / Backblaze B2 Compatible Storage (Optional)
+  S3_ENDPOINT?: string;
+  S3_BUCKET?: string;
+  S3_REGION?: string;
+  S3_ACCESS_KEY_ID?: string;
+  S3_SECRET_ACCESS_KEY?: string;
+
   // Secrets
   CREDENTIAL_KEK_V1?: string;
   CREDENTIAL_KEK_V2?: string;

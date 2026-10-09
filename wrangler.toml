@@ -31,7 +31,7 @@ new_sqlite_classes = ["SSHSessionDO", "RateLimitDO"]
 [[d1_databases]]
 binding = "DB"
 database_name = "edgejump-db"
-database_id = "local-edgejump-db"
+database_id = "local-edgejump-db" # 本地开发占位符；部署脚本会自动在目标账户中查找或创建，不把账户专属 ID 留在代码库
 migrations_dir = "migrations"
 
 # [可选] R2 对象存储桶（用于会话终端录像与审计回放；若不需要录像回放功能可保持注释）
@@ -41,4 +41,4 @@ migrations_dir = "migrations"
 
 [[kv_namespaces]]
 binding = "KV_CACHE"
-id = "edgejump-kv"
+id = "local-edgejump-kv" # 本地开发占位符；部署脚本会自动在目标账户中查找或创建，不把账户专属 ID 留在代码库
