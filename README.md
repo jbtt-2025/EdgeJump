@@ -110,7 +110,7 @@ Free 建议从 **1–2 路短时会话、Ed25519 密钥、少量监控连接**�
 
 保留现有 KEK 与 `AUTH_PEPPER`，应用全部未执行的 D1 迁移，并发布包含 `PASSWORD_KDF` 绑定及 DO migration 的新 Worker。自动部署脚本会处理这些配置；手工发布不能遗漏绑定。无需重置或改写旧密码哈希。
 
-本地回归覆盖模拟原生 100,000 次上限、与原生标准哈希的一致性、KDF 故障与限速退款、分批清理、真实 SSH 大量输出；workerd 冒烟测试覆盖内部 DO 的 600,000 次派生及静态资源路由/安全头。本地 workerd 与托管生产的限制可能不同，上游说明见 [workerd #1346](https://github.com/cloudflare/workerd/issues/1346#issuecomment-1874827249)。本次未部署远端，目标账户仍需验收初始化、登录、创建/重置密码，以及持续 SSH 输出、录像与清理的实际 CPU 和用量。
+本地测试覆盖模拟原生 100,000 次上限、与原生标准哈希的一致性、KDF 故障与限速退款、分批清理、真实 SSH 大量输出；workerd 冒烟测试覆盖内部 DO 的 600,000 次派生及静态资源路由/安全头。本地 workerd 与托管生产的限制可能不同，上游说明见 [workerd #1346](https://github.com/cloudflare/workerd/issues/1346#issuecomment-1874827249)。上线时应在目标账户验收初始化、登录、创建/重置密码，以及持续 SSH 输出、录像与清理的实际 CPU 和用量。
 
 CPU 数据从 Workers Logs 的 invocation 记录或 Tail Workers/Logpush 查看；Dashboard 的 `Exceeded CPU Time Limits` / `exceededCpu` 用于定位超限，`wrangler tail` 用于观察运行异常。
 
@@ -273,15 +273,13 @@ npm run typecheck
 
 浏览器验收在 loopback 启动真实 SSH 服务，使用本地 SQLite D1 适配器与内存录像存储，运行实际 Worker/DO 路由；不连接 Cloudflare 资源。测试只在连接器中将已校验的公网测试目标映射至本地 SSH，生产 SSRF 规则保持开启。
 
-### 从 V1 审查基线升级
+### 升级已有部署
 
 先应用 `migrations/0003_v1_review_fixes.sql` 与 `migrations/0004_recording_cleanup_progress.sql`，再发布新 Worker；自动部署脚本会执行全部未应用迁移。0003 增加 MFA 挑战、受限登录状态、退出码和待批准指纹，并补齐凭证 payload AAD 版本；0004 增加录像清理进度表。手工发布还需设置独立的 `SESSION_TICKET_SECRET` Secret，保留 `PASSWORD_KDF` 绑定和 `v2-password-kdf` DO migration；不能使用 Pepper 或 KEK 代替票据密钥。
 
 历史 `user_` / `sess_` ID 保持有效；新建用户统一 `usr_`，新建登录会话用 `auth_`。实体继续使用稳定 UUID；内置角色、权限与设置保留稳定语义键。
 
 需要 KEK 轮转时，先配置 `CREDENTIAL_KEK_V2`，再调用受 `credential.replace` 保护且有审计的 `POST /api/admin/credentials/:id/rewrap`，请求体为 `{"version":"v2"}`。它只重新包裹 DEK，保留凭证载荷的原 AAD 版本。完成所有凭证轮转前保留旧 KEK；TOTP Secret 目前仍依赖 `CREDENTIAL_KEK_V1`，因此 V1 必须继续保留该 Secret。
-
-修复范围、审查条目映射和验证证据见 [V1 修复记录](docs/compliance/v1-remediation_20261015.md)。
 
 ### 运维诊断与常用命令
 
