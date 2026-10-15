@@ -5,6 +5,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import '@xterm/xterm/css/xterm.css';
 import { Eye, ArrowLeft, Server, User, AlertOctagon } from 'lucide-react';
 import { api } from '../api/client';
+import { useAuth } from '../context/AuthContext';
 
 interface LiveMonitorProps {
   sessionId: string;
@@ -21,6 +22,7 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const [terminating, setTerminating] = useState(false);
+  const { hasPermission } = useAuth();
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -74,11 +76,8 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
       term.writeln('\r\n\x1b[33m[Live Monitor]\x1b[0m 会话已断开或结束。');
     };
 
-    const handleResize = () => fitAddon.fit();
-    window.addEventListener('resize', handleResize);
-
     return () => {
-      window.removeEventListener('resize', handleResize);
+      ws.onclose = null;
       ws.close();
       term.dispose();
     };
@@ -99,7 +98,7 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
   };
 
   return (
-    <div className="flex-1 flex flex-col h-full bg-slate-950 overflow-hidden">
+    <div className="h-dvh flex flex-col bg-slate-950 overflow-hidden">
       <div className="bg-slate-900 border-b border-slate-800 px-4 py-2 flex items-center justify-between text-xs text-slate-300">
         <div className="flex items-center space-x-4">
           <button
@@ -126,17 +125,17 @@ export const LiveMonitor: React.FC<LiveMonitorProps> = ({
           </span>
         </div>
 
-        <button
+        {hasPermission('session.terminate') && <button
           onClick={handleTerminate}
           disabled={terminating}
           className="flex items-center space-x-1 px-2.5 py-1 bg-red-950 hover:bg-red-900 border border-red-800 text-red-300 rounded transition font-medium"
         >
           <AlertOctagon className="w-3.5 h-3.5" />
           <span>强制切断会话</span>
-        </button>
+        </button>}
       </div>
 
-      <div className="flex-1 w-full h-full relative" ref={containerRef} />
+      <div className="flex-1 min-h-0 overflow-auto relative" ref={containerRef} />
     </div>
   );
 };

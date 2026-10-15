@@ -6,13 +6,13 @@ import {
   encryptCredential,
   decryptCredential,
   rotateCredentialKey,
-} from '../src/crypto/envelope.ts';
+} from '../../src/crypto/envelope.ts';
 
 import {
   hashPassword,
   verifyPassword,
   DEFAULT_PBKDF2_ITERATIONS,
-} from '../src/crypto/password.ts';
+} from '../../src/crypto/password.ts';
 
 import {
   generateTotpSecret,
@@ -21,18 +21,18 @@ import {
   getTotpUri,
   decodeBase32,
   encodeBase32,
-} from '../src/crypto/totp.ts';
+} from '../../src/crypto/totp.ts';
 
 import {
   generateSessionToken,
   hashToken,
   generateRecoveryCode,
   hashRecoveryCode,
-} from '../src/crypto/token.ts';
+} from '../../src/crypto/token.ts';
 
 import {
   bytesToHex,
-} from '../src/crypto/utils.ts';
+} from '../../src/crypto/utils.ts';
 
 // Helper to generate a 32-byte (64 hex char) master KEK
 function generateMasterKekHex(): string {

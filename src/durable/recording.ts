@@ -1,28 +1,10 @@
+import { logError } from '../logging.ts';
 // Terminal Session Recording Engine with WebStreams Gzip Compression and SHA-256 Hash Chaining for EdgeJump
 
 import { concat, toBufferSource } from '../ssh/utils.ts';
 
-export type TerminalEventType = 'connect' | 'stdout' | 'resize' | 'disconnect';
-
-export interface TerminalEvent {
-  seq: number;
-  t: number; // milliseconds since session start
-  type: TerminalEventType;
-  data?: unknown;
-  cols?: number;
-  rows?: number;
-  reason?: string;
-}
-
-export interface RecordingManifest {
-  sessionId: string;
-  chunkCount: number;
-  firstChunkHash: string | null;
-  finalHash: string | null;
-  startedAt: number;
-  endedAt: number;
-  recordingPath: string;
-}
+import type { TerminalEventType, TerminalEvent, RecordingManifest } from '../shared/types.ts';
+export type { TerminalEventType, TerminalEvent, RecordingManifest } from '../shared/types.ts';
 
 export interface ChunkFlushResult {
   chunkIndex: number;
@@ -142,7 +124,8 @@ export class SessionRecorder {
   private readonly storage?: RecordingStorage | null;
   private readonly recordingPrefix: string;
 
-  private eventsBuffer: TerminalEvent[] = [];
+  private eventsBuffer: Uint8Array[] = [];
+  private readonly encoder = new TextEncoder();
   private bufferedBytes: number = 0;
   private seqNum: number = 0;
   private chunkCount: number = 0;
@@ -150,6 +133,9 @@ export class SessionRecorder {
   private rollingHash: string | null = null;
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private isClosed: boolean = false;
+  private flushQueue: Promise<unknown> = Promise.resolve();
+  private chunks: { index: number; path: string; hash: string; rollingHash: string }[] = [];
+  private closePromise: Promise<RecordingManifest> | null = null;
 
   readonly maxChunkBytes: number = 512 * 1024; // 512 KiB threshold
   readonly flushIntervalMs: number = 15_000;   // 15 seconds threshold
@@ -190,7 +176,7 @@ export class SessionRecorder {
     this.flushTimer = setInterval(() => {
       if (this.eventsBuffer.length > 0 && !this.isClosed) {
         this.flushChunk().catch((err) => {
-          console.error(`[Recorder] Periodic flush error for session ${this.sessionId}:`, err);
+          logError(`[Recorder] Periodic flush error for session ${this.sessionId}:`, err);
         });
       }
     }, this.flushIntervalMs);
@@ -206,7 +192,7 @@ export class SessionRecorder {
     }
   }
 
-  recordEvent(type: TerminalEventType, data?: unknown, extra?: Partial<TerminalEvent>): void {
+  async recordEvent(type: TerminalEventType, data?: unknown, extra?: Partial<TerminalEvent>): Promise<void> {
     if (this.isClosed || !this.storage) return;
 
     this.seqNum++;
@@ -222,31 +208,28 @@ export class SessionRecorder {
       event.data = data;
     }
 
-    const serialized = JSON.stringify(event) + '\n';
-    const eventBytes = new TextEncoder().encode(serialized).length;
-
-    this.eventsBuffer.push(event);
-    this.bufferedBytes += eventBytes;
+    const serialized = this.encoder.encode(JSON.stringify(event) + '\n');
+    this.eventsBuffer.push(serialized);
+    this.bufferedBytes += serialized.length;
 
     if (this.bufferedBytes >= this.maxChunkBytes) {
-      this.flushChunk().catch((err) => {
-        console.error(`[Recorder] Max size flush error for session ${this.sessionId}:`, err);
-      });
+      await this.flushChunk();
     }
   }
 
-  async flushChunk(): Promise<ChunkFlushResult | null> {
-    if (this.eventsBuffer.length === 0 || !this.storage) {
-      return null;
-    }
-
-    const eventsToFlush = this.eventsBuffer;
+  flushChunk(): Promise<ChunkFlushResult | null> {
+    const events = this.eventsBuffer;
+    const size = this.bufferedBytes;
     this.eventsBuffer = [];
-    const uncompressedBytes = this.bufferedBytes;
     this.bufferedBytes = 0;
+    const task = this.flushQueue.then(() => this.flushNextChunk(events, size));
+    this.flushQueue = task;
+    return task;
+  }
 
-    const jsonlText = eventsToFlush.map((e) => JSON.stringify(e)).join('\n') + '\n';
-    const rawBytes = new TextEncoder().encode(jsonlText);
+  private async flushNextChunk(eventsToFlush: Uint8Array[], uncompressedBytes: number): Promise<ChunkFlushResult | null> {
+    if (!eventsToFlush.length || !this.storage) return null;
+    const rawBytes = concat(...eventsToFlush);
 
     // Compress chunk via WebStreams CompressionStream('gzip')
     const compressedGzip = await compressGzip(rawBytes);
@@ -254,15 +237,11 @@ export class SessionRecorder {
     // Compute chunk SHA-256
     const chunkHash = await computeChunkHash(compressedGzip);
 
-    if (this.firstChunkHash === null) {
-      this.firstChunkHash = chunkHash;
-    }
-
     // Maintain rolling hash chain: hash_k = SHA256(hash_{k-1} || chunk_hash)
-    this.rollingHash = await computeRollingHash(this.rollingHash, chunkHash);
+    const rollingHash = await computeRollingHash(this.rollingHash, chunkHash);
 
-    this.chunkCount++;
-    const paddedSeq = String(this.chunkCount).padStart(6, '0');
+    const nextIndex = this.chunkCount + 1;
+    const paddedSeq = String(nextIndex).padStart(6, '0');
     const chunkPath = `${this.recordingPrefix}/chunk-${paddedSeq}.jsonl.gz`;
 
     if (this.storage) {
@@ -270,24 +249,33 @@ export class SessionRecorder {
         contentType: 'application/gzip',
         customMetadata: {
           sessionId: this.sessionId,
-          chunkIndex: String(this.chunkCount),
+          chunkIndex: String(nextIndex),
           chunkHash,
-          rollingHash: this.rollingHash,
+          rollingHash,
         },
       });
     }
 
+    this.chunkCount = nextIndex;
+    this.rollingHash = rollingHash;
+    this.firstChunkHash ??= chunkHash;
+    this.chunks.push({ index: nextIndex, path: chunkPath, hash: chunkHash, rollingHash });
     return {
       chunkIndex: this.chunkCount,
       uncompressedBytes,
       compressedBytes: compressedGzip.length,
       chunkHash,
-      rollingHash: this.rollingHash,
+      rollingHash,
       path: chunkPath,
     };
   }
 
-  async close(disconnectReason?: string): Promise<RecordingManifest> {
+  close(disconnectReason?: string): Promise<RecordingManifest> {
+    if (!this.closePromise) this.closePromise = this.finish(disconnectReason);
+    return this.closePromise;
+  }
+
+  private async finish(disconnectReason?: string): Promise<RecordingManifest> {
     if (this.isClosed) {
       return {
         sessionId: this.sessionId,
@@ -315,12 +303,14 @@ export class SessionRecorder {
     }
 
     // Record disconnect event before marking closed
-    this.recordEvent('disconnect', undefined, { reason: disconnectReason || 'closed' });
+    try {
+      await this.recordEvent('disconnect', undefined, { reason: disconnectReason || 'closed' });
+    } finally {
+      this.isClosed = true;
+      this.stopPeriodicFlush();
+    }
 
-    this.isClosed = true;
-    this.stopPeriodicFlush();
-
-    // Flush remaining buffer
+    // All size/time-triggered writes finish before the final chunk and manifest.
     await this.flushChunk();
 
     const endedAt = Date.now();
@@ -332,6 +322,9 @@ export class SessionRecorder {
       startedAt: this.startedAt,
       endedAt,
       recordingPath: this.recordingPrefix,
+      firstChunk: this.chunks[0]?.path ?? null,
+      lastChunk: this.chunks.at(-1)?.path ?? null,
+      chunks: this.chunks,
     };
 
     if (this.storage) {

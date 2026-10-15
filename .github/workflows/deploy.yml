@@ -6,11 +6,6 @@ on:
       - main
       - master
   workflow_dispatch:
-    inputs:
-      bootstrap_token:
-        description: '首次超级管理员初始化 Token（留空则自动生成并显示在部署摘要中）'
-        required: false
-        type: string
 
 concurrency:
   group: production-deploy
@@ -50,12 +45,18 @@ jobs:
       - name: Run Tests
         run: npm test
 
+      - name: Install browser for acceptance tests
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser acceptance tests
+        run: npm run test:browser
+
       - name: Provision D1 & KV, migrate, inject secrets and deploy Worker
         run: npm run deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
-          BOOTSTRAP_TOKEN: ${{ inputs.bootstrap_token || secrets.BOOTSTRAP_TOKEN || vars.BOOTSTRAP_TOKEN }}
+          BOOTSTRAP_TOKEN: ${{ secrets.BOOTSTRAP_TOKEN }}
           WORKER_NAME: ${{ vars.WORKER_NAME }}
           CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN || vars.CUSTOM_DOMAIN }}
           S3_ENDPOINT: ${{ secrets.S3_ENDPOINT || vars.S3_ENDPOINT }}

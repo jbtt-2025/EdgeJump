@@ -27,6 +27,7 @@ const SENSITIVE_KEY_PATTERNS = [
   /totp/i,
   /cookie/i,
   /credential.*plain/i,
+  /authorization/i,
 ];
 
 /**
@@ -63,6 +64,8 @@ export async function recordAuditEvent(
   const timestamp = Date.now();
 
   let metadataJson: string | null = null;
+  const actor = event.actorUsername === undefined && event.actorUserId
+    ? await db.prepare('SELECT username FROM users WHERE id = ?').bind(event.actorUserId).first<{ username: string }>() : null;
   if (event.metadata) {
     const cleanMeta = sanitizeAuditMetadata(event.metadata);
     metadataJson = JSON.stringify(cleanMeta);
@@ -80,7 +83,7 @@ export async function recordAuditEvent(
       id,
       timestamp,
       event.actorUserId ?? null,
-      event.actorUsername ?? (event.actorUserId ? 'unknown' : 'system'),
+      event.actorUsername ?? actor?.username ?? 'system',
       event.action,
       event.resourceType,
       event.resourceId ?? null,
@@ -102,6 +105,7 @@ export async function listAuditEvents(
     offset?: number;
     action?: string;
     actorUserId?: string;
+    resourceId?: string;
   } = {}
 ): Promise<AuditEventSummary[]> {
   const limit = Math.min(options.limit ?? 50, 200);
@@ -119,6 +123,7 @@ export async function listAuditEvents(
     conditions.push('actor_user_id = ?');
     params.push(options.actorUserId);
   }
+  if (options.resourceId) { conditions.push('resource_id = ?'); params.push(options.resourceId); }
 
   if (conditions.length > 0) {
     query += ' WHERE ' + conditions.join(' AND ');

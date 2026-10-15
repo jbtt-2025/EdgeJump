@@ -3,6 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTestDatabase } from './mock-d1.ts';
+import { createPasswordKdfNamespace } from './password-kdf-fixture.ts';
 import { handleApiRequest } from '../src/api/router.ts';
 import { cleanupExpiredRecordings } from '../src/sessions/cleanup-service.ts';
 import { createUser } from '../src/users/user-service.ts';
@@ -16,6 +17,7 @@ async function setupTestContext(deployType: 'production' | 'demo' = 'demo') {
     DB: db,
     DEPLOY_TYPE: deployType,
     AUTH_PEPPER: 'test-pepper',
+    PASSWORD_KDF: createPasswordKdfNamespace('test-pepper'),
     CREDENTIAL_KEK_V1: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',
   };
 
@@ -31,6 +33,7 @@ async function setupTestContext(deployType: 'production' | 'demo' = 'demo') {
     env
   );
 
+  await db.prepare('UPDATE users SET mfa_enabled = 1 WHERE id = ?').bind(admin.id).run();
   // 2. Create regular user
   const developer = await createUser(
     {
@@ -66,7 +69,8 @@ test('demo mode: blocks modifying admin password while allowing regular user pas
     headers: {
       'Content-Type': 'application/json',
       'Origin': 'https://bastion.test',
-      Cookie: `${COOKIE_NAME}=${adminToken}`,
+      Cookie: `${COOKIE_NAME}=${adminToken}; __Host-edgejump_csrf=${'a'.repeat(64)}`,
+      'X-CSRF-Token': 'a'.repeat(64),
     },
     body: JSON.stringify({ password: 'NewAdminPassword999!' }),
   });
@@ -81,7 +85,8 @@ test('demo mode: blocks modifying admin password while allowing regular user pas
     headers: {
       'Content-Type': 'application/json',
       'Origin': 'https://bastion.test',
-      Cookie: `${COOKIE_NAME}=${adminToken}`,
+      Cookie: `${COOKIE_NAME}=${adminToken}; __Host-edgejump_csrf=${'a'.repeat(64)}`,
+      'X-CSRF-Token': 'a'.repeat(64),
     },
   });
   const disableAdminRes = await handleApiRequest(disableAdminReq, env);
@@ -95,7 +100,8 @@ test('demo mode: blocks modifying admin password while allowing regular user pas
     headers: {
       'Content-Type': 'application/json',
       'Origin': 'https://bastion.test',
-      Cookie: `${COOKIE_NAME}=${adminToken}`,
+      Cookie: `${COOKIE_NAME}=${adminToken}; __Host-edgejump_csrf=${'a'.repeat(64)}`,
+      'X-CSRF-Token': 'a'.repeat(64),
     },
     body: JSON.stringify({ password: 'NewDevPassword999!' }),
   });
@@ -112,7 +118,8 @@ test('demo mode: blocks modifying recording_retention_days while allowing other 
     headers: {
       'Content-Type': 'application/json',
       'Origin': 'https://bastion.test',
-      Cookie: `${COOKIE_NAME}=${adminToken}`,
+      Cookie: `${COOKIE_NAME}=${adminToken}; __Host-edgejump_csrf=${'a'.repeat(64)}`,
+      'X-CSRF-Token': 'a'.repeat(64),
     },
     body: JSON.stringify({ key: 'recording_retention_days', value: '30' }),
   });
@@ -127,7 +134,8 @@ test('demo mode: blocks modifying recording_retention_days while allowing other 
     headers: {
       'Content-Type': 'application/json',
       'Origin': 'https://bastion.test',
-      Cookie: `${COOKIE_NAME}=${adminToken}`,
+      Cookie: `${COOKIE_NAME}=${adminToken}; __Host-edgejump_csrf=${'a'.repeat(64)}`,
+      'X-CSRF-Token': 'a'.repeat(64),
     },
     body: JSON.stringify({ key: 'session_idle_timeout', value: '900' }),
   });
@@ -144,7 +152,8 @@ test('production mode: allows modifying admin password and recording_retention_d
     headers: {
       'Content-Type': 'application/json',
       'Origin': 'https://bastion.test',
-      Cookie: `${COOKIE_NAME}=${adminToken}`,
+      Cookie: `${COOKIE_NAME}=${adminToken}; __Host-edgejump_csrf=${'a'.repeat(64)}`,
+      'X-CSRF-Token': 'a'.repeat(64),
     },
     body: JSON.stringify({ key: 'recording_retention_days', value: '14' }),
   });
@@ -157,7 +166,8 @@ test('production mode: allows modifying admin password and recording_retention_d
     headers: {
       'Content-Type': 'application/json',
       'Origin': 'https://bastion.test',
-      Cookie: `${COOKIE_NAME}=${adminToken}`,
+      Cookie: `${COOKIE_NAME}=${adminToken}; __Host-edgejump_csrf=${'a'.repeat(64)}`,
+      'X-CSRF-Token': 'a'.repeat(64),
     },
     body: JSON.stringify({ password: 'NewAdminPassword999!' }),
   });
@@ -168,6 +178,7 @@ test('production mode: allows modifying admin password and recording_retention_d
 test('lifecycle cleanup: purges expired session recordings from storage and updates D1 status', async () => {
   const { env, db } = await setupTestContext('production');
 
+  await db.prepare("INSERT INTO system_settings (key, value, updated_at) VALUES ('recording_retention_days', '7', 0) ON CONFLICT(key) DO UPDATE SET value = '7'").run();
   // Create mock storage tracker
   const storedObjects = new Map<string, any>();
   const mockStorage: RecordingStorage = {

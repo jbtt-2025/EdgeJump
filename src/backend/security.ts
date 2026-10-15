@@ -76,7 +76,8 @@ export async function verifyTicket(
 
     // IP validation is optional when client is proxied through CDN/reverse proxy
     return typeof payload.exp === 'number' && Number.isFinite(payload.exp)
-      && payload.exp >= Date.now() && payload.exp <= Date.now() + TICKET_TTL_MS + 5000
+      && payload.exp > Date.now() && payload.exp <= Date.now() + TICKET_TTL_MS + 5000
+      && (ip === undefined || payload.ip === ip)
       && typeof payload.nonce === 'string'
       && /^[0-9a-f-]{36}$/i.test(payload.nonce);
   } catch {
@@ -109,6 +110,10 @@ export function normalizeIPv6(host: string): string {
 
 export function isPrivateAddress(host: string): boolean {
   const value = host.toLowerCase().trim().replace(/^\[|\]$/g, '');
+
+  // Reject alternate numeric IPv4 forms (decimal/octal/hex/shorthand), malformed
+  // hostnames, URL authorities, zone IDs and invalid IPv6 before resolution.
+  if (!isValidTargetHostname(value)) return true;
 
   // Localhost, internal, and cloud metadata hostnames
   if (
@@ -155,6 +160,9 @@ export function isPrivateAddress(host: string): boolean {
     /^f[cd]/.test(ipv6) || // fc00::/7 Unique Local
     /^fe[89ab]/.test(ipv6) || // fe80::/10 Link-Local
     ipv6.startsWith('2001:db8:') || // 2001:db8::/32 Documentation
+    ipv6.startsWith('64:ff9b:') || // NAT64 can embed otherwise blocked IPv4
+    ipv6.startsWith('2002:') || // 6to4 can embed otherwise blocked IPv4
+    (ipv6.startsWith('::') && !ipv6.startsWith('::ffff:')) || // IPv4-compatible addresses
     ipv6.startsWith('ff') // ff00::/8 Multicast
   ) {
     return true;
@@ -185,6 +193,22 @@ export function toSocketHostname(address: string): string {
 interface DnsAnswer { type: number; data: string }
 
 export type DnsResolver = (host: string, type: 'A' | 'AAAA') => Promise<string[]>;
+
+let customDnsResolver: DnsResolver | undefined;
+export function setCustomDnsResolver(resolver?: DnsResolver): void {
+  customDnsResolver = resolver;
+}
+
+export function isValidTargetHostname(host: string): boolean {
+  if (host.includes(':')) {
+    try { return !host.includes('%') && new URL(`http://[${host}]/`).hostname.length > 0; }
+    catch { return false; }
+  }
+  if (isIPv4(host)) return true;
+  if (/^(?:0x[0-9a-f]+|\d+)(?:\.(?:0x[0-9a-f]+|\d+))*$/i.test(host)) return false;
+  return host.length <= 253 && host.split('.').every((label) =>
+    label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label));
+}
 
 async function defaultResolveDnsType(host: string, type: 'A' | 'AAAA'): Promise<string[]> {
   const endpoint = 'https://cloudflare-dns.com/dns-query';
@@ -220,7 +244,7 @@ async function defaultResolveDnsType(host: string, type: 'A' | 'AAAA'): Promise<
 export async function resolvePublicAddresses(
   host: string,
   mode: 'strict' | 'best-effort' = 'strict',
-  resolver: DnsResolver = defaultResolveDnsType,
+  resolver: DnsResolver = customDnsResolver ?? defaultResolveDnsType,
 ): Promise<string[]> {
   if (host.includes(':') || isIPv4(host)) return [host];
   const types = ['A', 'AAAA'] as const;
@@ -239,7 +263,7 @@ export async function resolvePublicAddresses(
 export async function assertPublicTarget(
   host: string,
   port?: number,
-  resolver: DnsResolver = defaultResolveDnsType,
+  resolver: DnsResolver = customDnsResolver ?? defaultResolveDnsType,
 ): Promise<string[]> {
   if (port !== undefined) {
     if (!Number.isInteger(port) || port < 1 || port > 65535) {

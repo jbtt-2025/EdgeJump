@@ -257,37 +257,11 @@ export async function decryptCredential(
     const credNonceBytes = base64ToBytes(credentialNonceB64);
     const cipherBytes = base64ToBytes(ciphertextB64);
 
-    let credentialBuffer: ArrayBuffer;
     const credAad = buildCredentialAad(credentialId, type, credKeyVersion);
-
-    try {
-      credentialBuffer = await crypto.subtle.decrypt(
-        {
-          name: 'AES-GCM',
-          iv: toBufferSource(credNonceBytes),
-          additionalData: toBufferSource(credAad),
-        },
-        dekKey,
-        toBufferSource(cipherBytes)
-      );
-    } catch (err) {
-      // In case the blob was loaded from a DB row where key_version was rotated to 'v2'
-      // but credentialKeyVersion wasn't explicitly saved, fallback to 'v1'
-      if (!encryptedBlob.credentialKeyVersion && credKeyVersion !== 'v1') {
-        const fallbackAad = buildCredentialAad(credentialId, type, 'v1');
-        credentialBuffer = await crypto.subtle.decrypt(
-          {
-            name: 'AES-GCM',
-            iv: toBufferSource(credNonceBytes),
-            additionalData: toBufferSource(fallbackAad),
-          },
-          dekKey,
-          toBufferSource(cipherBytes)
-        );
-      } else {
-        throw err;
-      }
-    }
+    const credentialBuffer = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: toBufferSource(credNonceBytes), additionalData: toBufferSource(credAad) },
+      dekKey, toBufferSource(cipherBytes)
+    );
 
     decryptedBytes = new Uint8Array(credentialBuffer);
     return decodeUtf8(decryptedBytes);

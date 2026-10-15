@@ -15,6 +15,7 @@ export const Login: React.FC = () => {
   const [email, setEmail] = useState('');
 
   const [mfaRequired, setMfaRequired] = useState(false);
+  const [challengeToken, setChallengeToken] = useState('');
   const [totpCode, setTotpCode] = useState('');
   const [recoveryCode, setRecoveryCode] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -47,12 +48,13 @@ export const Login: React.FC = () => {
           displayName: displayName || username,
           email: email || undefined,
         });
+        await api.login({ username, password });
         const me = await api.getMe();
-        login(me.user, me.permissions);
+        login(me.user, me.permissions, me.deployType);
         return;
       }
 
-      const res = await api.login({
+      const res = mfaRequired ? await api.completeMfa(challengeToken, totpCode || undefined, recoveryCode || undefined) : await api.login({
         username,
         password,
         totpCode: totpCode || undefined,
@@ -60,13 +62,15 @@ export const Login: React.FC = () => {
       });
 
       if (res.mfaRequired) {
+        setChallengeToken((res as { challengeToken?: string }).challengeToken ?? '');
+        setPassword('');
         setMfaRequired(true);
         setLoading(false);
         return;
       }
 
       const me = await api.getMe();
-      login(me.user, me.permissions);
+      login(me.user, me.permissions, me.deployType);
     } catch (err: any) {
       setError(err.message || '操作失败');
     } finally {

@@ -1,6 +1,6 @@
 import type { Env, UserRow, AuthSessionRow, AuthenticatedUser } from '../types.ts';
 import type { UserSummary } from '../shared/types.ts';
-import { verifyPassword } from '../crypto/password.ts';
+import { verifyUserPassword } from './password-service.ts';
 import {
   generateSessionToken,
   hashToken,
@@ -21,6 +21,7 @@ import {
   toBufferSource,
 } from '../crypto/utils.ts';
 import { recordAuditEvent } from '../audit/audit-service.ts';
+import { getAllSettings, getSetting } from '../settings/settings-service.ts';
 
 export const SESSION_TTL_MS = 8 * 3600 * 1000; // 8 hours absolute TTL per Section 7
 export const COOKIE_NAME = 'edgejump_session';
@@ -30,6 +31,7 @@ export interface LoginInput {
   password: string;
   totpCode?: string;
   recoveryCode?: string;
+  mfaChallenge?: string;
   clientIp: string;
   userAgent?: string;
 }
@@ -41,15 +43,23 @@ export interface LoginSuccessResult {
   user: UserSummary;
   roles: string[];
   permissions: string[];
+  mfaSetupRequired: boolean;
 }
 
 export interface LoginMfaRequiredResult {
   mfaRequired: true;
   userId: string;
   username: string;
+  challengeToken: string;
 }
 
 export type LoginResult = LoginSuccessResult | LoginMfaRequiredResult;
+
+export async function isMfaRequired(userId: string, db: D1Database): Promise<boolean> {
+  const { permissions } = await getUserRolesAndPermissions(userId, db);
+  return [...permissions].some((permission) => permission !== 'session.view_own') ||
+    await getSetting('require_mfa_for_all', db) === 'true';
+}
 
 /**
  * Builds the HttpOnly Secure SameSite=Strict cookie header for EdgeJump web sessions.
@@ -216,13 +226,17 @@ export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
     // default to 600,000
   }
 
-  const pepper = env.AUTH_PEPPER || '';
-  const validPassword = await verifyPassword(
+  const challengeHash = input.mfaChallenge ? await hashToken(input.mfaChallenge) : null;
+  const challenge = challengeHash ? await env.DB.prepare(`SELECT user_id FROM auth_mfa_challenges
+    WHERE token_hash = ? AND used_at IS NULL AND expires_at > ? AND ip = ?`)
+    .bind(challengeHash, Date.now(), input.clientIp).first<{ user_id: string }>() : null;
+  const validPassword = input.mfaChallenge ? challenge?.user_id === user.id : await verifyUserPassword(
+    user.id,
     input.password,
-    pepper,
     user.password_hash,
     user.password_salt,
-    iterations
+    iterations,
+    env
   );
 
   if (!validPassword) {
@@ -247,10 +261,15 @@ export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
   // 4. MFA Validation if mfa_enabled is 1
   if (user.mfa_enabled === 1) {
     if (!input.totpCode && !input.recoveryCode) {
+      const challengeToken = generateSessionToken();
+      await env.DB.prepare('DELETE FROM auth_mfa_challenges WHERE expires_at <= ?').bind(Date.now()).run();
+      await env.DB.prepare('INSERT INTO auth_mfa_challenges (token_hash, user_id, ip, expires_at) VALUES (?, ?, ?, ?)')
+        .bind(await hashToken(challengeToken), user.id, input.clientIp, Date.now() + 5 * 60_000).run();
       return {
         mfaRequired: true,
         userId: user.id,
         username: user.username,
+        challengeToken,
       };
     }
 
@@ -315,25 +334,35 @@ export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
       }
 
       // Mark recovery code used
-      await env.DB.prepare('UPDATE mfa_recovery_codes SET used_at = ? WHERE id = ?')
+      const consumed = await env.DB.prepare('UPDATE mfa_recovery_codes SET used_at = ? WHERE id = ? AND used_at IS NULL')
         .bind(Date.now(), recoveryRow.id)
         .run();
+      if (!consumed.meta.changes) throw new Error('Invalid or already used recovery code');
     }
+  }
+
+  if (challengeHash) {
+    const used = await env.DB.prepare('UPDATE auth_mfa_challenges SET used_at = ? WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?')
+      .bind(Date.now(), challengeHash, Date.now()).run();
+    if (!used.meta.changes) throw new Error('Invalid or expired MFA challenge');
   }
 
   // 5. Create Web Login Session
   const now = Date.now();
   const sessionToken = generateSessionToken();
   const tokenHash = await hashToken(sessionToken);
-  const sessionId = `sess_${crypto.randomUUID()}`;
-  const expiresAt = now + SESSION_TTL_MS;
+  const sessionId = `auth_${crypto.randomUUID()}`;
+  const settings = await getAllSettings(env.DB);
+  const ttlMs = Number(settings.auth_session_absolute_ttl) * 1000;
+  const expiresAt = now + ttlMs;
+  const mfaPending = user.mfa_enabled !== 1 && await isMfaRequired(user.id, env.DB);
 
   await env.DB.prepare(
     `INSERT INTO auth_sessions (
-      id, user_id, token_hash, created_at, last_seen_at, expires_at, ip, user_agent, revoked_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+      id, user_id, token_hash, created_at, last_seen_at, expires_at, ip, user_agent, revoked_at, mfa_pending
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`
   )
-    .bind(sessionId, user.id, tokenHash, now, now, expiresAt, input.clientIp, input.userAgent ?? null)
+    .bind(sessionId, user.id, tokenHash, now, now, expiresAt, input.clientIp, input.userAgent ?? null, mfaPending ? 1 : 0)
     .run();
 
   // Update user's last_login_at
@@ -360,7 +389,7 @@ export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
     env.DB
   );
 
-  const cookie = buildSessionCookie(sessionToken, Math.floor(SESSION_TTL_MS / 1000));
+  const cookie = buildSessionCookie(sessionToken, Math.floor(ttlMs / 1000));
 
   const userSummary: UserSummary = {
     id: user.id,
@@ -380,7 +409,8 @@ export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
     cookie,
     user: userSummary,
     roles,
-    permissions: Array.from(permissions),
+    permissions: mfaPending ? [] : Array.from(permissions),
+    mfaSetupRequired: mfaPending,
   };
 }
 
@@ -407,7 +437,10 @@ export async function validateSession(
     return null;
   }
 
-  if (session.expires_at <= now) {
+  const settings = await getAllSettings(db);
+  if (session.expires_at <= now || now - session.created_at >= Number(settings.auth_session_absolute_ttl) * 1000 ||
+      now - session.last_seen_at >= Number(settings.auth_session_idle_ttl) * 1000) {
+    await db.prepare('UPDATE auth_sessions SET revoked_at = ? WHERE id = ?').bind(now, session.id).run();
     return null;
   }
 
@@ -436,6 +469,8 @@ export async function validateSession(
     email: user.email,
     roles,
     permissions,
+    mfaEnabled: user.mfa_enabled === 1,
+    mfaPending: session.mfa_pending === 1 || (user.mfa_enabled !== 1 && await isMfaRequired(user.id, db)),
   };
 }
 
@@ -446,7 +481,8 @@ export async function logout(
   sessionToken: string,
   db: D1Database,
   actorUserId?: string,
-  clientIp: string = '127.0.0.1'
+  clientIp: string = '127.0.0.1',
+  userAgent?: string
 ): Promise<string> {
   if (!sessionToken) {
     return buildClearSessionCookie();
@@ -473,6 +509,7 @@ export async function logout(
         resourceType: 'session',
         resourceId: session.id,
         sourceIp: clientIp,
+        userAgent,
         result: 'success',
       },
       db
@@ -501,6 +538,8 @@ export async function setupMfa(
   if (!user) {
     throw new Error('User not found');
   }
+
+  if (user.mfa_enabled === 1) throw new Error('MFA is already enabled');
 
   const secret = generateTotpSecret();
   const uri = getTotpUri(secret, user.username, 'EdgeJump');
@@ -546,7 +585,8 @@ export async function confirmMfa(
   userId: string,
   code: string,
   env: Env,
-  clientIp: string = '127.0.0.1'
+  clientIp: string = '127.0.0.1',
+  userAgent?: string
 ): Promise<boolean> {
   const masterKek = env.CREDENTIAL_KEK_V1;
   if (!masterKek) {
@@ -587,6 +627,7 @@ export async function confirmMfa(
       resourceId: userId,
       resourceName: user.username,
       sourceIp: clientIp,
+      userAgent,
       result: 'success',
     },
     env.DB
@@ -601,7 +642,8 @@ export async function confirmMfa(
 export async function disableMfa(
   userId: string,
   db: D1Database,
-  clientIp: string = '127.0.0.1'
+  clientIp: string = '127.0.0.1',
+  userAgent?: string
 ): Promise<void> {
   const now = Date.now();
   const user = await db.prepare('SELECT username FROM users WHERE id = ?').bind(userId).first<{ username: string }>();
@@ -624,8 +666,19 @@ export async function disableMfa(
       resourceType: 'user',
       resourceId: userId,
       sourceIp: clientIp,
+      userAgent,
       result: 'success',
     },
     db
   );
+}
+
+export async function verifyMfaProof(userId: string, password: string, code: string, env: Env): Promise<boolean> {
+  if (typeof password !== 'string' || typeof code !== 'string') return false;
+  const user = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first<UserRow>();
+  if (!user?.totp_secret_ciphertext || !user.totp_secret_nonce || !env.CREDENTIAL_KEK_V1) return false;
+  const { iterations } = JSON.parse(user.password_params);
+  if (!await verifyUserPassword(userId, password, user.password_hash, user.password_salt, iterations, env)) return false;
+  const secret = await decryptTotpSecret(user.totp_secret_ciphertext, user.totp_secret_nonce, userId, env.CREDENTIAL_KEK_V1);
+  return verifyTotpCode(secret, code);
 }

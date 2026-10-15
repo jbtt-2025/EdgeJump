@@ -1,7 +1,8 @@
+import { logError } from '../logging.ts';
 // User, Group, and Role Management Service (System RBAC Control Plane)
 
 import type { Env, UserRow, GroupRow, RoleRow, PermissionRow, AuthenticatedUser } from '../types.ts';
-import { hashPassword } from '../crypto/password.ts';
+import { hashUserPassword } from '../auth/password-service.ts';
 import { recordAuditEvent } from '../audit/audit-service.ts';
 import { terminateSession } from '../sessions/session-service.ts';
 import { getSetting } from '../settings/settings-service.ts';
@@ -41,6 +42,7 @@ export interface GroupSummary {
   name: string;
   description: string | null;
   memberCount: number;
+  memberIds?: string[];
   createdAt: number;
   updatedAt: number;
 }
@@ -93,7 +95,8 @@ export async function createUser(
   input: CreateUserInput,
   actorUserId: string,
   env: Env,
-  clientIp: string = '127.0.0.1'
+  clientIp: string = '127.0.0.1',
+  userAgent?: string
 ): Promise<UserSummary> {
   const username = input.username.trim().toLowerCase();
   if (!username) throw new Error('Username is required');
@@ -111,10 +114,7 @@ export async function createUser(
 
   const userId = `usr_${crypto.randomUUID()}`;
   const now = Date.now();
-  const iterations = 600000;
-  const pepper = env.AUTH_PEPPER || '';
-
-  const { hash, salt } = await hashPassword(input.password, pepper, iterations);
+  const { hash, salt, iterations } = await hashUserPassword(userId, input.password, env);
   const displayName = input.displayName?.trim() || username;
 
   await env.DB.prepare(
@@ -173,6 +173,7 @@ export async function createUser(
       resourceId: userId,
       resourceName: username,
       sourceIp: clientIp,
+      userAgent,
       result: 'success',
       metadata: { roles, groups: input.groups || [] },
     },
@@ -202,7 +203,8 @@ export async function updateUser(
   input: UpdateUserInput,
   actorUserId: string,
   db: D1Database,
-  clientIp: string = '127.0.0.1'
+  clientIp: string = '127.0.0.1',
+  userAgent?: string
 ): Promise<void> {
   const user = await db.prepare('SELECT id, username FROM users WHERE id = ?')
     .bind(userId)
@@ -246,6 +248,7 @@ export async function updateUser(
       resourceId: userId,
       resourceName: user.username,
       sourceIp: clientIp,
+      userAgent,
       result: 'success',
       metadata: { displayName: input.displayName, email: input.email, roles: input.roles, groups: input.groups },
     },
@@ -263,7 +266,8 @@ export async function disableUser(
   userId: string,
   actorUserId: string,
   env: Env,
-  clientIp: string = '127.0.0.1'
+  clientIp: string = '127.0.0.1',
+  userAgent?: string
 ): Promise<void> {
   const user = await env.DB.prepare('SELECT id, username FROM users WHERE id = ?')
     .bind(userId)
@@ -280,6 +284,7 @@ export async function disableUser(
     .bind(now, userId)
     .run();
 
+  const failedSessions: string[] = [];
   // Terminate active SSH sessions if setting is true
   const terminateSetting = await getSetting('terminate_active_sessions_on_disable', env.DB, 'true');
   if (terminateSetting === 'true') {
@@ -291,9 +296,10 @@ export async function disableUser(
 
     for (const session of activeSessions.results || []) {
       try {
-        await terminateSession(session.id, actorUserId, env, 'User account was disabled');
+        await terminateSession(session.id, actorUserId, env, 'User account was disabled', { sourceIp: clientIp, userAgent });
       } catch (err) {
-        console.error(`Failed to terminate active session ${session.id}:`, err);
+        logError(`Failed to terminate active session ${session.id}:`, err);
+        failedSessions.push(session.id);
       }
     }
   }
@@ -306,10 +312,13 @@ export async function disableUser(
       resourceId: userId,
       resourceName: user.username,
       sourceIp: clientIp,
+      userAgent,
       result: 'success',
+      metadata: { failedSessionIds: failedSessions },
     },
     env.DB
   );
+  if (failedSessions.length) throw new Error('User disabled; some active sessions could not be terminated. Retry termination from online sessions.');
 }
 
 /**
@@ -319,7 +328,8 @@ export async function enableUser(
   userId: string,
   actorUserId: string,
   db: D1Database,
-  clientIp: string = '127.0.0.1'
+  clientIp: string = '127.0.0.1',
+  userAgent?: string
 ): Promise<void> {
   const user = await db.prepare('SELECT id, username FROM users WHERE id = ?')
     .bind(userId)
@@ -339,6 +349,7 @@ export async function enableUser(
       resourceId: userId,
       resourceName: user.username,
       sourceIp: clientIp,
+      userAgent,
       result: 'success',
     },
     db
@@ -353,7 +364,8 @@ export async function resetUserPassword(
   newPassword: string,
   actorUserId: string,
   env: Env,
-  clientIp: string = '127.0.0.1'
+  clientIp: string = '127.0.0.1',
+  userAgent?: string
 ): Promise<void> {
   if (!newPassword || newPassword.length < 8) {
     throw new Error('Password must be at least 8 characters');
@@ -364,9 +376,7 @@ export async function resetUserPassword(
     .first<{ id: string; username: string }>();
   if (!user) throw new Error('User not found');
 
-  const iterations = 600000;
-  const pepper = env.AUTH_PEPPER || '';
-  const { hash, salt } = await hashPassword(newPassword, pepper, iterations);
+  const { hash, salt, iterations } = await hashUserPassword(userId, newPassword, env);
   const now = Date.now();
 
   await env.DB.prepare(
@@ -388,6 +398,7 @@ export async function resetUserPassword(
       resourceId: userId,
       resourceName: user.username,
       sourceIp: clientIp,
+      userAgent,
       result: 'success',
       metadata: { reason: 'Password reset' },
     },
@@ -412,6 +423,7 @@ export async function listGroups(db: D1Database): Promise<GroupSummary[]> {
       name: g.name,
       description: g.description,
       memberCount: countRes?.count ?? 0,
+      memberIds: (await db.prepare('SELECT user_id FROM group_members WHERE group_id = ?').bind(g.id).all<{ user_id: string }>()).results.map((row) => row.user_id),
       createdAt: g.created_at,
       updatedAt: g.updated_at,
     });
@@ -424,7 +436,8 @@ export async function createGroup(
   input: { name: string; description?: string },
   actorUserId: string,
   db: D1Database,
-  clientIp: string = '127.0.0.1'
+  clientIp: string = '127.0.0.1',
+  userAgent?: string
 ): Promise<GroupSummary> {
   const name = input.name.trim();
   if (!name) throw new Error('Group name is required');
@@ -444,6 +457,7 @@ export async function createGroup(
       resourceId: groupId,
       resourceName: name,
       sourceIp: clientIp,
+      userAgent,
       result: 'success',
     },
     db
@@ -464,7 +478,8 @@ export async function updateGroup(
   input: { name?: string; description?: string; members?: string[] },
   actorUserId: string,
   db: D1Database,
-  clientIp: string = '127.0.0.1'
+  clientIp: string = '127.0.0.1',
+  userAgent?: string
 ): Promise<void> {
   const group = await db.prepare('SELECT id, name FROM groups WHERE id = ?').bind(groupId).first<GroupRow>();
   if (!group) throw new Error('Group not found');
@@ -491,6 +506,7 @@ export async function updateGroup(
       resourceId: groupId,
       resourceName: group.name,
       sourceIp: clientIp,
+      userAgent,
       result: 'success',
     },
     db
@@ -501,7 +517,8 @@ export async function deleteGroup(
   groupId: string,
   actorUserId: string,
   db: D1Database,
-  clientIp: string = '127.0.0.1'
+  clientIp: string = '127.0.0.1',
+  userAgent?: string
 ): Promise<void> {
   const group = await db.prepare('SELECT id, name FROM groups WHERE id = ?').bind(groupId).first<GroupRow>();
   if (!group) throw new Error('Group not found');
@@ -516,6 +533,7 @@ export async function deleteGroup(
       resourceId: groupId,
       resourceName: group.name,
       sourceIp: clientIp,
+      userAgent,
       result: 'success',
     },
     db

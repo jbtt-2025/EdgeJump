@@ -1,13 +1,8 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { api } from '../api/client';
+import type { MeResponse } from '../../../src/shared/types';
 
-export interface User {
-  id: string;
-  username: string;
-  displayName: string;
-  email: string | null;
-  roles: string[];
-}
+export type User = MeResponse['user'];
 
 interface AuthContextType {
   user: User | null;

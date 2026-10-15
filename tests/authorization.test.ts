@@ -545,8 +545,10 @@ describe('Asset Authorization Engine (JumpServer Model)', () => {
       DB: db,
       CREDENTIAL_KEK_V1: masterKek,
       AUTH_PEPPER: 'test-pepper',
-      SSH_SESSIONS: undefined as any,
+      SESSION_TICKET_SECRET: 'test-ticket-key',
+      SSH_SESSIONS: { idFromName: (name: string) => name, get: () => ({ fetch: async () => Response.json({ success: true }) }) } as any,
       RATE_LIMIT: undefined as any,
+      PASSWORD_KDF: undefined as any,
       RECORDINGS: undefined as any,
       KV_CACHE: undefined as any,
     };

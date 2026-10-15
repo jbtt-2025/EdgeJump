@@ -1,6 +1,6 @@
 import type { AssetRow, AssetGroupRow, AssetAccountRow, CredentialType, SSHHostKeyRow } from '../types.ts';
 import type { AssetSummary, AssetGroupSummary, AssetAccountSummary } from '../shared/types.ts';
-import { isPrivateAddress } from '../backend/security.ts';
+import { assertPublicTarget } from '../backend/security.ts';
 import { recordAuditEvent } from '../audit/audit-service.ts';
 
 export interface CreateAssetInput {
@@ -70,9 +70,7 @@ export async function createAsset(
     throw new Error(`Invalid port: ${port}`);
   }
 
-  if (isPrivateAddress(hostname)) {
-    throw new Error('Private and reserved SSH targets are disabled');
-  }
+  await assertPublicTarget(hostname, port);
 
   const id = `asset_${crypto.randomUUID()}`;
   const now = Date.now();
@@ -162,9 +160,6 @@ export async function updateAsset(
   if (input.hostname !== undefined) {
     hostname = input.hostname.trim();
     if (!hostname) throw new Error('Asset hostname cannot be empty');
-    if (isPrivateAddress(hostname)) {
-      throw new Error('Private and reserved SSH targets are disabled');
-    }
   }
 
   let port = existing.port;
@@ -176,6 +171,7 @@ export async function updateAsset(
   }
 
   const name = input.name !== undefined ? input.name.trim() : existing.name;
+  if (input.hostname !== undefined || input.port !== undefined) await assertPublicTarget(hostname, port);
   if (!name) throw new Error('Asset name cannot be empty');
 
   const description = input.description !== undefined ? input.description : existing.description;
@@ -349,6 +345,11 @@ export async function updateAssetGroup(
     if (input.parentId) {
       const parent = await db.prepare('SELECT id FROM asset_groups WHERE id = ?').bind(input.parentId).first();
       if (!parent) throw new Error(`Parent asset group not found: ${input.parentId}`);
+      const cycle = await db.prepare(`WITH RECURSIVE descendants(id) AS (
+        SELECT id FROM asset_groups WHERE id = ?
+        UNION SELECT g.id FROM asset_groups g JOIN descendants d ON g.parent_id = d.id
+      ) SELECT id FROM descendants WHERE id = ?`).bind(id, input.parentId).first();
+      if (cycle) throw new Error('Asset group cannot be moved into its descendants');
     }
     parentId = input.parentId;
   }
@@ -646,28 +647,34 @@ export async function getHostKeyForAsset(
     .first<SSHHostKeyRow>();
 }
 
-export async function resetHostKeyForAsset(
-  assetId: string,
-  actorUserId: string,
-  db: D1Database
-): Promise<void> {
-  const asset = await getAsset(assetId, db);
-  if (!asset) throw new Error(`Asset not found: ${assetId}`);
-
-  await db.prepare('DELETE FROM ssh_host_keys WHERE asset_id = ?').bind(assetId).run();
-
-  await recordAuditEvent(
-    {
-      actorUserId,
-      action: 'HOST_KEY_CHANGED',
-      resourceType: 'host_key',
-      resourceId: assetId,
-      resourceName: asset.name,
-      sourceIp: '127.0.0.1',
-      result: 'success',
-      metadata: { reason: 'Reset by administrator for new verification' },
-    },
-    db
-  );
+export async function listHostKeysForAsset(assetId: string, db: D1Database): Promise<SSHHostKeyRow[]> {
+  const rows = await db.prepare('SELECT * FROM ssh_host_keys WHERE asset_id = ? ORDER BY created_at').bind(assetId).all<SSHHostKeyRow>();
+  return rows.results || [];
 }
 
+export async function resetHostKeyForAsset(
+  assetId: string, actorUserId: string, db: D1Database
+): Promise<void> {
+  if (!await getAsset(assetId, db)) throw new Error('Asset not found');
+  await db.batch([
+    db.prepare("UPDATE assets SET host_key_policy = 'approval_required' WHERE id = ?").bind(assetId),
+    db.prepare("UPDATE ssh_host_keys SET status = 'unverified' WHERE asset_id = ?").bind(assetId),
+  ]);
+}
+
+export async function approveHostKeyForAsset(
+  assetId: string, algorithm: string, fingerprint: string, actorUserId: string, db: D1Database
+): Promise<void> {
+  const rows = await listHostKeysForAsset(assetId, db);
+  const row = rows.find((key) => key.algorithm === algorithm &&
+    (key.candidate_fingerprint === fingerprint || key.fingerprint === fingerprint));
+  if (!row) throw new Error('Host key fingerprint is not an observed key for this asset');
+  const publicKey = row.candidate_fingerprint === fingerprint ? row.candidate_public_key : row.public_key;
+  await db.batch([
+    db.prepare("DELETE FROM ssh_host_keys WHERE asset_id = ? AND id != ? AND status != 'verified'").bind(assetId, row.id),
+    db.prepare(`UPDATE ssh_host_keys SET fingerprint = ?, public_key = ?, status = 'verified',
+      verified_by = ?, verified_at = ?, candidate_fingerprint = NULL, candidate_public_key = NULL WHERE id = ?`)
+      .bind(fingerprint, publicKey, actorUserId, Date.now(), row.id),
+    db.prepare("UPDATE assets SET host_key_policy = 'strict', last_seen_host_key = ? WHERE id = ?").bind(fingerprint, assetId),
+  ]);
+}

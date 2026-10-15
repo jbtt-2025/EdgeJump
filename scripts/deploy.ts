@@ -164,18 +164,18 @@ async function main(): Promise<void> {
   }
 
   // 超级管理员引导 Token
-  let generatedBootstrapToken: string | null = null;
+  if (!existingSecrets.has('SESSION_TICKET_SECRET')) {
+    const secret = process.env.SESSION_TICKET_SECRET?.trim() || randomBytes(32).toString('hex');
+    maskSecret(secret);
+    secretsToPut.SESSION_TICKET_SECRET = secret;
+  }
+
   if (process.env.BOOTSTRAP_TOKEN?.trim()) {
     const token = process.env.BOOTSTRAP_TOKEN.trim();
     maskSecret(token);
     secretsToPut.BOOTSTRAP_TOKEN = token;
-    generatedBootstrapToken = token;
   } else if (!existingSecrets.has('BOOTSTRAP_TOKEN')) {
-    const token = randomBytes(24).toString('base64url');
-    maskSecret(token);
-    secretsToPut.BOOTSTRAP_TOKEN = token;
-    generatedBootstrapToken = token;
-    console.log('✓ 已自动生成超级管理员引导令牌 (BOOTSTRAP_TOKEN)');
+    throw new Error('首次部署请先配置 BOOTSTRAP_TOKEN Secret（本地使用 .env；CI 使用加密 Secret）。');
   }
 
   // 可选：外部 S3 / Backblaze B2 录像存储凭证
@@ -249,11 +249,7 @@ async function main(): Promise<void> {
 
   console.log('\n============================================================');
   console.log(`🎉 EdgeJump 部署成功！访问地址: ${appUrl}`);
-  if (generatedBootstrapToken) {
-    console.log(`🔑 首次超级管理员初始化引导令牌 (BOOTSTRAP_TOKEN):`);
-    console.log(`   ${generatedBootstrapToken}`);
-    console.log(`👉 打开 ${appUrl} 进入向导输入上述 Token 完成账号创建！`);
-  }
+  console.log('首次初始化请使用你配置的 BOOTSTRAP_TOKEN Secret；初始化完成后该令牌永久失效。');
   console.log('============================================================\n');
 
   if (process.env.GITHUB_STEP_SUMMARY) {
@@ -265,15 +261,7 @@ async function main(): Promise<void> {
       `* **D1 数据库**: \`${database.name}\` (\`${database.uuid}\`)`,
       `* **KV 缓存**: \`${kv.title}\` (\`${kv.id}\`)`,
       '',
-      ...(generatedBootstrapToken
-        ? [
-            '### 🔑 首次超级管理员初始化 Token (BOOTSTRAP_TOKEN)',
-            '```',
-            generatedBootstrapToken,
-            '```',
-            `请立即访问 [${appUrl}](${appUrl})，系统将提示输入此 Token 完成超级管理员初始化。初始化后该 Token 将永久失效。`,
-          ]
-        : ['* **超级管理员状态**: 已初始化或沿用已有配置。']),
+      '* **首次初始化**: 使用已配置的 BOOTSTRAP_TOKEN Secret。令牌不会写入日志或作业摘要。',
     ].join('\n');
 
     await writeFile(process.env.GITHUB_STEP_SUMMARY, summary, 'utf8');

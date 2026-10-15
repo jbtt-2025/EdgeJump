@@ -1,6 +1,7 @@
 export interface Env {
   SSH_SESSIONS: DurableObjectNamespace;
   RATE_LIMIT: DurableObjectNamespace;
+  PASSWORD_KDF: DurableObjectNamespace;
   DB: D1Database;
   RECORDINGS?: R2Bucket;
   KV_CACHE: KVNamespace;
@@ -18,6 +19,7 @@ export interface Env {
   CREDENTIAL_KEK_V2?: string;
   AUTH_PEPPER?: string;
   BOOTSTRAP_TOKEN?: string;
+  SESSION_TICKET_SECRET?: string;
 
   // Vars
   CONNECT_TIMEOUT_MS?: string;
@@ -59,6 +61,7 @@ export interface AuthSessionRow {
   ip: string;
   user_agent: string | null;
   revoked_at: number | null;
+  mfa_pending: number;
 }
 
 export interface AssetRow {
@@ -105,6 +108,7 @@ export interface CredentialRow {
   encrypted_dek: string;
   dek_nonce: string;
   key_version: string;
+  credential_key_version: string;
   algorithm: string;
   created_at: number;
   updated_at: number;
@@ -120,6 +124,8 @@ export interface SSHHostKeyRow {
   verified_by: string | null;
   status: HostKeyStatus;
   created_at: number;
+  candidate_fingerprint: string | null;
+  candidate_public_key: string | null;
 }
 
 export interface SSHSessionRow {
@@ -142,6 +148,8 @@ export interface SSHSessionRow {
   recording_path: string | null;
   recording_hash: string | null;
   created_at: number;
+  exit_code: number | null;
+  exit_signal: string | null;
 }
 
 export interface GroupRow {
@@ -222,5 +230,7 @@ export interface AuthenticatedUser {
   email: string | null;
   roles: string[];
   permissions: Set<string>;
+  mfaEnabled: boolean;
+  mfaPending: boolean;
 }
 

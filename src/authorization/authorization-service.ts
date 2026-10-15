@@ -38,23 +38,8 @@ export interface UpdateAuthorizationRuleInput {
   actions?: string[];
 }
 
-export interface AuthorizedAssetAccount {
-  id: string;
-  username: string;
-  credentialType: CredentialType;
-  credentialName: string;
-}
-
-export interface AuthorizedAsset {
-  id: string;
-  name: string;
-  hostname: string;
-  port: number;
-  description: string | null;
-  platform: string;
-  environment: string;
-  accounts: AuthorizedAssetAccount[];
-}
+import type { AuthorizedAssetAccount, AuthorizedAsset } from '../shared/types.ts';
+export type { AuthorizedAssetAccount, AuthorizedAsset } from '../shared/types.ts';
 
 export interface AccessCheckResult {
   authorized: boolean;
@@ -71,6 +56,7 @@ export async function createAuthorizationRule(
   createdBy: string | null,
   db: D1Database
 ): Promise<AuthorizationRuleSummary> {
+  validateRuleInput(input);
   const name = input.name.trim();
   if (!name) throw new Error('Rule name is required');
 
@@ -224,6 +210,7 @@ export async function updateAuthorizationRule(
   input: UpdateAuthorizationRuleInput,
   db: D1Database
 ): Promise<AuthorizationRuleSummary> {
+  validateRuleInput(input);
   const existing = await getAuthorizationRule(id, db);
   if (!existing) throw new Error(`Authorization rule not found: ${id}`);
 
@@ -237,6 +224,7 @@ export async function updateAuthorizationRule(
     input.enabled !== undefined ? (input.enabled ? 1 : 0) : existing.enabled ? 1 : 0;
   const validFrom = input.validFrom !== undefined ? input.validFrom : existing.validFrom;
   const validUntil = input.validUntil !== undefined ? input.validUntil : existing.validUntil;
+  validateRuleInput({ validFrom, validUntil });
   const now = Date.now();
 
   await db
@@ -443,7 +431,7 @@ export async function checkUserAssetAccountAccess(
       .all<{ action: string }>();
 
     const ruleActions = (actionRows || []).map((r) => r.action);
-    if (ruleActions.length > 0 && !ruleActions.includes(action)) {
+    if (!ruleActions.includes(action)) {
       continue;
     }
 
@@ -573,7 +561,7 @@ export async function getAuthorizedAssetsForUser(
       .all<{ action: string }>();
 
     const ruleActions = (actionRows || []).map((r) => r.action);
-    if (ruleActions.length > 0 && !ruleActions.includes('connect')) {
+    if (!ruleActions.includes('connect')) {
       continue;
     }
 
@@ -704,11 +692,32 @@ export async function getAuthorizedAssetsForUser(
         platform: asset.platform,
         environment: asset.environment,
         accounts: Array.from(accounts.values()),
+        groupIds: [],
       });
     }
+  }
+
+  for (const asset of result) {
+    const memberships = await db.prepare('SELECT group_id FROM asset_group_members WHERE asset_id = ?').bind(asset.id).all<{ group_id: string }>();
+    asset.groupIds = (memberships.results || []).map((row) => row.group_id);
+    const rows = await db.prepare(`WITH RECURSIVE paths(id, name, parent_id) AS (
+      SELECT g.id, g.name, g.parent_id FROM asset_groups g JOIN asset_group_members m ON m.group_id = g.id WHERE m.asset_id = ?
+      UNION SELECT g.id, g.name, g.parent_id FROM asset_groups g JOIN paths p ON g.id = p.parent_id
+    ) SELECT * FROM paths`).bind(asset.id).all<{ id: string; name: string; parent_id: string | null }>();
+    asset.groups = (rows.results || []).map((group) => ({ id: group.id, name: group.name, parentId: group.parent_id }));
   }
 
   // Sort by asset name
   result.sort((a, b) => a.name.localeCompare(b.name));
   return result;
+}
+
+function validateRuleInput(input: UpdateAuthorizationRuleInput): void {
+  if (input.actions !== undefined && (!Array.isArray(input.actions) || !input.actions.length || input.actions.some((action) => action !== 'connect'))) {
+    throw new Error('V1 authorization actions must contain connect only');
+  }
+  for (const time of [input.validFrom, input.validUntil]) {
+    if (time != null && (!Number.isSafeInteger(time) || time < 0)) throw new Error('Invalid authorization time');
+  }
+  if (input.validFrom != null && input.validUntil != null && input.validFrom > input.validUntil) throw new Error('Invalid authorization time range');
 }

@@ -1,5 +1,31 @@
 // HTTP & WebSocket Security Utilities per AGENTS.md Sections 63 & 64
 
+export const CSRF_COOKIE = '__Host-edgejump_csrf';
+
+export function readCookie(request: Request, name: string): string | null {
+  const cookies = request.headers.get('Cookie')?.split(';') ?? [];
+  return cookies.map((cookie) => cookie.trim()).find((cookie) => cookie.startsWith(`${name}=`))?.slice(name.length + 1) ?? null;
+}
+
+export function issueCsrfToken(request: Request): Response {
+  const existing = readCookie(request, CSRF_COOKIE);
+  const token = existing && /^[a-f0-9]{64}$/.test(existing) ? existing :
+    Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return jsonResponse({ csrfToken: token }, 200, {
+    'Set-Cookie': `${CSRF_COOKIE}=${token}; Path=/; Secure; HttpOnly; SameSite=Strict`,
+  });
+}
+
+export function validateCsrfToken(request: Request): boolean {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(request.method.toUpperCase())) return true;
+  const cookie = readCookie(request, CSRF_COOKIE);
+  const header = request.headers.get('X-CSRF-Token');
+  if (!cookie || !header || !/^[a-f0-9]{64}$/.test(cookie) || header.length !== cookie.length) return false;
+  let mismatch = 0;
+  for (let index = 0; index < cookie.length; index++) mismatch |= cookie.charCodeAt(index) ^ header.charCodeAt(index);
+  return mismatch === 0;
+}
+
 export function isProductionHttp(request: Request): boolean {
   const proto = request.headers.get('X-Forwarded-Proto')?.toLowerCase();
   return proto === 'http';
@@ -50,6 +76,7 @@ export function validateCsrfOrigin(request: Request): boolean {
 }
 
 export function secureHeaders(response: Response): Response {
+  if (response.status === 101) return response;
   const headers = new Headers(response.headers);
 
   // Security Headers per Section 64

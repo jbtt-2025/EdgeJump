@@ -9,7 +9,10 @@ export const DEFAULT_SETTINGS: Record<string, string> = {
   terminate_active_sessions_on_disable: 'true',
   terminate_sessions_on_permission_revocation: 'false',
   require_mfa_for_all: 'false',
-  recording_retention_days: '7', // 7 days retention for audit recordings
+  auth_session_absolute_ttl: '28800',
+  auth_session_idle_ttl: '1800',
+  disconnect_on_browser_close: 'true',
+  recording_retention_days: '0', // Infrastructure retention is preferred; application deletion is opt-in.
 };
 
 /**
@@ -49,8 +52,17 @@ export async function updateSetting(
   key: string,
   value: string,
   actorUserId: string,
-  db: D1Database
+  db: D1Database,
+  clientIp = '127.0.0.1',
+  userAgent?: string
 ): Promise<void> {
+  if (!(key in DEFAULT_SETTINGS)) throw new Error('Unknown system setting');
+  if (DEFAULT_SETTINGS[key] === 'true' || DEFAULT_SETTINGS[key] === 'false') {
+    if (value !== 'true' && value !== 'false') throw new Error('Setting must be true or false');
+  } else if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value)) ||
+    (key !== 'recording_retention_days' && Number(value) < 1)) {
+    throw new Error('Setting must be a valid duration');
+  }
   const now = Date.now();
   await db
     .prepare(
@@ -65,7 +77,8 @@ export async function updateSetting(
       action: 'SETTING_CHANGED',
       resourceType: 'system_setting',
       resourceId: key,
-      sourceIp: '127.0.0.1',
+      sourceIp: clientIp,
+      userAgent,
       result: 'success',
       metadata: { key, value },
     },

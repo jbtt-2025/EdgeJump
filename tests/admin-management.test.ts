@@ -29,6 +29,7 @@ import {
   getSessionCommands,
 } from '../src/sessions/session-service.ts';
 import type { Env } from '../src/types.ts';
+import { createPasswordKdfNamespace } from './password-kdf-fixture.ts';
 
 describe('Admin Management & Lifecycle (Sections 5, 13, 39, 41, 60, 70)', () => {
   let db: any;
@@ -41,13 +42,14 @@ describe('Admin Management & Lifecycle (Sections 5, 13, 39, 41, 60, 70)', () => 
       SSH_SESSIONS: {
         idFromName: (name: string) => ({ toString: () => name }),
         get: () => ({
-          fetch: async () => new Response('OK'),
+          fetch: async (request: Request) => { const body = await request.json() as any; await db.prepare("UPDATE ssh_sessions SET status = 'terminated', terminated_by = ? WHERE id = 'ssh-sess-1'").bind(body.actorId).run(); return Response.json({ success: true }); },
         }),
       } as any,
       RATE_LIMIT: {} as any,
       RECORDINGS: {} as any,
       KV_CACHE: {} as any,
       AUTH_PEPPER: 'test-admin-pepper',
+      PASSWORD_KDF: createPasswordKdfNamespace('test-admin-pepper'),
       CREDENTIAL_KEK_V1: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
     };
   });
@@ -211,7 +213,8 @@ describe('Admin Management & Lifecycle (Sections 5, 13, 39, 41, 60, 70)', () => 
     // Admin resets host key
     await resetHostKeyForAsset(asset.id, 'admin-1', env.DB);
     const hostKeyAfter = await getHostKeyForAsset(asset.id, env.DB);
-    assert.strictEqual(hostKeyAfter, null);
+    assert.strictEqual(hostKeyAfter?.status, 'unverified');
+    assert.strictEqual(hostKeyAfter?.fingerprint, hostKey.fingerprint);
   });
 
   it('manages system settings (Sections 45, 60)', async () => {

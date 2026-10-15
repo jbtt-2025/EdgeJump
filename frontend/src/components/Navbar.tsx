@@ -13,7 +13,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
   if (!user) return null;
 
   return (
-    <header className="bg-slate-800 border-b border-slate-700 px-6 py-3 flex items-center justify-between select-none">
+    <header className="bg-slate-800 border-b border-slate-700 px-6 py-3 flex flex-wrap gap-4 items-center justify-between select-none">
       <div className="flex items-center space-x-6">
         <div className="flex items-center space-x-2 text-blue-400 font-bold text-lg cursor-pointer" onClick={() => onSelectTab('dashboard')}>
           <Shield className="w-6 h-6" />
@@ -26,6 +26,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
         </div>
 
         <nav className="flex items-center space-x-2">
+          {hasPermission('session.view_own') && <button onClick={() => onSelectTab('sessions')} className={`px-3 py-1.5 rounded-md text-sm ${currentTab === 'sessions' ? 'bg-blue-600' : 'hover:bg-slate-700'}`}>我的会话</button>}
           <button
             onClick={() => onSelectTab('dashboard')}
             className={`flex items-center space-x-2 px-3 py-1.5 rounded-md text-sm font-medium transition ${
@@ -36,7 +37,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
             <span>资产控制台</span>
           </button>
 
-          {(hasPermission('asset.read') || hasPermission('authorization.read')) && (
+          {['asset.read', 'authorization.read', 'user.read', 'group.read', 'settings.read'].some(hasPermission) && (
             <button
               onClick={() => onSelectTab('admin')}
               className={`flex items-center space-x-2 px-3 py-1.5 rounded-md text-sm font-medium transition ${
@@ -63,6 +64,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
       </div>
 
       <div className="flex items-center space-x-4">
+        <button onClick={() => onSelectTab('security')} className="text-sm text-slate-300">账户安全</button>
         <div className="flex items-center space-x-2 text-sm text-slate-300">
           <UserIcon className="w-4 h-4 text-slate-400" />
           <span>{user.displayName || user.username}</span>

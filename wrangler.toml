@@ -10,7 +10,7 @@ command = "npm run build:web"
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
-run_worker_first = true
+run_worker_first = ["/api", "/api/*"]
 
 [vars]
 CONNECT_TIMEOUT_MS = "10000"
@@ -18,7 +18,7 @@ ENVIRONMENT = "production"
 DEPLOY_TYPE = "production" # 部署模式: production (默认正式模式) | demo (演示站模式)
 
 [triggers]
-crons = ["0 3 * * *"] # 每日 UTC 03:00 自动触发审计录像生命周期清理
+crons = ["*/15 * * * *"] # 每 15 分钟按请求预算清理一批；默认保留策略不执行删除
 
 [[durable_objects.bindings]]
 name = "SSH_SESSIONS"
@@ -28,9 +28,17 @@ class_name = "SSHSessionDO"
 name = "RATE_LIMIT"
 class_name = "RateLimitDO"
 
+[[durable_objects.bindings]]
+name = "PASSWORD_KDF"
+class_name = "PasswordKdfDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SSHSessionDO", "RateLimitDO"]
+
+[[migrations]]
+tag = "v2-password-kdf"
+new_sqlite_classes = ["PasswordKdfDO"]
 
 [[d1_databases]]
 binding = "DB"

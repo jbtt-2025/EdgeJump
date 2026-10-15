@@ -82,14 +82,10 @@ export class MockD1Database {
 export async function createTestDatabase(): Promise<D1Database> {
   const db = new MockD1Database();
 
-  const m1Path = path.resolve(process.cwd(), 'migrations', '0001_initial_schema.sql');
-  const m2Path = path.resolve(process.cwd(), 'migrations', '0002_initial_roles_permissions.sql');
-
-  const m1 = fs.readFileSync(m1Path, 'utf8');
-  const m2 = fs.readFileSync(m2Path, 'utf8');
-
-  await db.exec(m1);
-  await db.exec(m2);
+  const directory = path.resolve(process.cwd(), 'migrations');
+  for (const file of fs.readdirSync(directory).filter((name) => name.endsWith('.sql')).sort()) {
+    await db.exec(fs.readFileSync(path.join(directory, file), 'utf8'));
+  }
 
   return db as unknown as D1Database;
 }

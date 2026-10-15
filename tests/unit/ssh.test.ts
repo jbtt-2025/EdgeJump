@@ -7,32 +7,32 @@ import {
   SSH_VERSION,
   isSSH2Identification,
   SSHTransport,
-} from '../src/ssh/transport.ts';
+} from '../../src/ssh/transport.ts';
 import {
   SSHPacketParser,
   SSHPacketBuilder,
   nextSequenceNumber,
-} from '../src/ssh/packet.ts';
+} from '../../src/ssh/packet.ts';
 import {
   KEXInitBuilder,
   parseKEXInit,
   negotiate,
   parseServerSigAlgs,
   filterExtInfo,
-} from '../src/ssh/kex.ts';
-import { Curve25519KeyExchange } from '../src/ssh/kex-curve25519.ts';
-import { ECDHKeyExchange } from '../src/ssh/kex-ecdh.ts';
+} from '../../src/ssh/kex.ts';
+import { Curve25519KeyExchange } from '../../src/ssh/kex-curve25519.ts';
+import { ECDHKeyExchange } from '../../src/ssh/kex-ecdh.ts';
 import {
   SSHAESGCMCipher,
   SSHAESCTRCipher,
   SSHHMAC,
-} from '../src/ssh/crypto.ts';
-import { KeyDerivation } from '../src/ssh/keys.ts';
+} from '../../src/ssh/crypto.ts';
+import { KeyDerivation } from '../../src/ssh/keys.ts';
 import {
   classifyHostKey,
   computeHostKeyFingerprint,
   verifyHostKeySignature,
-} from '../src/ssh/host-key.ts';
+} from '../../src/ssh/host-key.ts';
 import {
   buildPasswordAuthRequest,
   buildKeyboardInteractiveAuthRequest,
@@ -40,8 +40,8 @@ import {
   passwordResponsesForChallenge,
   buildKeyboardInteractiveResponse,
   isSupportedPasswordPrompt,
-} from '../src/ssh/auth-password.ts';
-import { SSHChannel } from '../src/ssh/channel.ts';
+} from '../../src/ssh/auth-password.ts';
+import { SSHChannel } from '../../src/ssh/channel.ts';
 import {
   concat,
   encodeString,
@@ -51,13 +51,13 @@ import {
   fromBase64,
   toBase64Url,
   fromBase64Url,
-} from '../src/ssh/utils.ts';
+} from '../../src/ssh/utils.ts';
 import {
   SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
   SSH_MSG_USERAUTH_INFO_REQUEST,
   getCipherSpec,
   getMacSpec,
-} from '../src/ssh/types.ts';
+} from '../../src/ssh/types.ts';
 
 test('transport: SSH version banner and identification parsing', () => {
   assert.equal(SSH_VERSION, 'SSH-2.0-EdgeJump_1.0');

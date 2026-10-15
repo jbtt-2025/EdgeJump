@@ -1,6 +1,8 @@
 // Shared API Types for EdgeJump Bastion
 
 export type SystemRole = 'role_super_admin' | 'role_asset_admin' | 'role_security_auditor' | 'role_user';
+export type AuthorizationAction = 'connect' | 'sftp_read' | 'sftp_upload' | 'sftp_download' | 'port_forward';
+export type { PermissionCode } from './permissions.ts';
 
 export interface UserSummary {
   id: string;
@@ -95,6 +97,8 @@ export interface HistoricalSessionSummary extends OnlineSessionSummary {
   disconnectReason: string | null;
   recordingPath: string | null;
   recordingHash: string | null;
+  exitCode?: number | null;
+  exitSignal?: string | null;
 }
 
 export interface AuditEventSummary {
@@ -118,6 +122,58 @@ export interface LoginResponse {
 }
 
 export interface MeResponse {
-  user: UserSummary;
+  user: Pick<UserSummary, 'id' | 'username' | 'displayName' | 'email' | 'roles'> & { mfaEnabled: boolean; mfaPending: boolean; mfaRequired: boolean };
   permissions: string[];
+  deployType?: string;
+}
+
+export interface AuthorizedAssetAccount {
+  id: string;
+  username: string;
+  credentialType: 'password' | 'private_key';
+  credentialName: string;
+}
+
+export interface AuthorizedAsset {
+  id: string;
+  name: string;
+  hostname: string;
+  port: number;
+  description: string | null;
+  platform: string;
+  environment: string;
+  accounts: AuthorizedAssetAccount[];
+  groupIds: string[];
+  groups?: { id: string; name: string; parentId: string | null }[];
+}
+
+export type TerminalEventType = 'connect' | 'stdout' | 'resize' | 'disconnect';
+export interface TerminalEvent {
+  seq: number;
+  t: number;
+  type: TerminalEventType;
+  data?: unknown;
+  cols?: number;
+  rows?: number;
+  reason?: string;
+}
+export interface RecordingManifest {
+  sessionId: string;
+  chunkCount: number;
+  firstChunkHash: string | null;
+  finalHash: string | null;
+  startedAt: number;
+  endedAt: number;
+  recordingPath: string;
+  firstChunk?: string | null;
+  lastChunk?: string | null;
+  chunks?: { index: number; path: string; hash: string; rollingHash: string }[];
+}
+
+export interface AdminUserSummary extends UserSummary { groups: string[]; updatedAt: number }
+export interface UserGroupSummary { id: string; name: string; description: string | null; memberCount: number; memberIds: string[] }
+export interface RoleSummary { id: string; name: string; description: string | null; permissions: string[] }
+export interface HostKeySummary {
+  id: string; algorithm: string; fingerprint: string; status: 'verified' | 'unverified' | 'changed';
+  verified_at: number | null; created_at: number; candidate_fingerprint: string | null;
 }

@@ -1,8 +1,21 @@
-import { bytesToHex, hexToBytes, encodeUtf8, timingSafeEqual, toBufferSource } from './utils.ts';
+import { pbkdf2Async } from '@noble/hashes/pbkdf2.js';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex, hexToBytes, encodeUtf8, timingSafeEqual } from './utils.ts';
 
 export const DEFAULT_PBKDF2_ITERATIONS = 600_000;
 export const DEFAULT_SALT_BYTES = 16;
 export const PASSWORD_ALGORITHM = 'pbkdf2-sha256';
+
+// Standard PBKDF2, independent of the managed Workers native iteration cap.
+// Production callers run this in PasswordKdfDO, outside the HTTP Worker's CPU budget.
+async function derivePassword(password: string, pepper: string, salt: Uint8Array, iterations: number): Promise<Uint8Array> {
+  const material = encodeUtf8(pepper ? `${password}${pepper}` : password);
+  try {
+    return await pbkdf2Async(sha256, material, salt, { c: iterations, dkLen: 32 });
+  } finally {
+    material.fill(0);
+  }
+}
 
 export interface HashPasswordResult {
   hash: string;
@@ -25,33 +38,12 @@ export async function hashPassword(
   iterations: number = DEFAULT_PBKDF2_ITERATIONS
 ): Promise<HashPasswordResult> {
   const salt = crypto.getRandomValues(new Uint8Array(DEFAULT_SALT_BYTES));
-  const combinedPassword = pepper ? `${password}${pepper}` : password;
-
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    toBufferSource(encodeUtf8(combinedPassword)),
-    { name: 'PBKDF2' },
-    false,
-    ['deriveBits']
-  );
-
-  const derivedBits = await crypto.subtle.deriveBits(
-    {
-      name: 'PBKDF2',
-      salt: toBufferSource(salt),
-      iterations,
-      hash: 'SHA-256',
-    },
-    keyMaterial,
-    256 // 32 bytes = 256 bits
-  );
-
-  return {
-    hash: bytesToHex(new Uint8Array(derivedBits)),
-    salt: bytesToHex(salt),
-    iterations,
-    algorithm: PASSWORD_ALGORITHM,
-  };
+  const derived = await derivePassword(password, pepper, salt, iterations);
+  try {
+    return { hash: bytesToHex(derived), salt: bytesToHex(salt), iterations, algorithm: PASSWORD_ALGORITHM };
+  } finally {
+    derived.fill(0);
+  }
 }
 
 /**
@@ -71,32 +63,11 @@ export async function verifyPassword(
   salt: string,
   iterations: number = DEFAULT_PBKDF2_ITERATIONS
 ): Promise<boolean> {
+  if (!/^[a-f\d]{64}$/i.test(hash) || !/^(?:[a-f\d]{2})+$/i.test(salt)) return false;
+  const derived = await derivePassword(password, pepper, hexToBytes(salt), iterations);
   try {
-    const saltBytes = hexToBytes(salt);
-    const expectedHashBytes = hexToBytes(hash);
-    const combinedPassword = pepper ? `${password}${pepper}` : password;
-
-    const keyMaterial = await crypto.subtle.importKey(
-      'raw',
-      toBufferSource(encodeUtf8(combinedPassword)),
-      { name: 'PBKDF2' },
-      false,
-      ['deriveBits']
-    );
-
-    const derivedBits = await crypto.subtle.deriveBits(
-      {
-        name: 'PBKDF2',
-        salt: toBufferSource(saltBytes),
-        iterations,
-        hash: 'SHA-256',
-      },
-      keyMaterial,
-      256
-    );
-
-    return timingSafeEqual(new Uint8Array(derivedBits), expectedHashBytes);
-  } catch {
-    return false;
+    return timingSafeEqual(derived, hexToBytes(hash));
+  } finally {
+    derived.fill(0);
   }
 }

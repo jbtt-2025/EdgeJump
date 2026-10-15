@@ -1,3 +1,5 @@
+import { createContext, seedDemoTopology } from './compliance-helpers.ts';
+import { verifyAssetHostKey } from '../src/assets/host-key-verification.ts';
 // Unit and Integration Tests for Session Recording, Hash Chaining, Command Heuristics, and Durable Objects
 
 import test from 'node:test';
@@ -333,7 +335,7 @@ test('ratelimit: RateLimitDO enforces sliding window and lockout TTL', async () 
 });
 
 test('ssh-session: SSHSessionDO HTTP endpoints (init, ticket, status, terminate)', async () => {
-  const session = new SSHSessionDO();
+  const session = new SSHSessionDO(undefined, { SESSION_TICKET_SECRET: 'unit-ticket-key' } as any);
 
   // 1. POST /init
   const initReq = new Request('http://localhost/init', {
@@ -359,7 +361,7 @@ test('ssh-session: SSHSessionDO HTTP endpoints (init, ticket, status, terminate)
   assert.equal(session.getStatus(), 'connecting');
 
   // 2. POST /ticket
-  const ticketReq = new Request('http://localhost/ticket', { method: 'POST' });
+  const ticketReq = new Request('http://localhost/ticket', { method: 'POST', headers: { 'x-user-id': 'usr_admin' } });
   const ticketRes = await session.fetch(ticketReq);
   assert.equal(ticketRes.status, 200);
   const ticketJson = (await ticketRes.json()) as any;
@@ -450,122 +452,18 @@ test('ssh-session: SSHSessionDO correctly persists recording_status = none when 
   assert.equal(sessionUpdateData.recordingHash, null);
 });
 
-test('tofu: Host key TOFU auto-trusts on first use, verifies on reconnect, blocks on changed', async () => {
-  const hostKeysTable = new Map<string, any>();
-  const auditEventsList: any[] = [];
-
-  const mockDb = {
-    prepare(query: string) {
-      return {
-        bind(...args: any[]) {
-          return {
-            async first<T = any>() {
-              if (query.includes('FROM ssh_host_keys')) {
-                const assetId = args[0];
-                const algo = args[1];
-                return (hostKeysTable.get(`${assetId}:${algo}`) as T) || null;
-              }
-              return null;
-            },
-            async run() {
-              if (query.includes('INSERT INTO ssh_host_keys') || query.includes('ON CONFLICT')) {
-                const id = args[0];
-                const assetId = args[1];
-                const algo = args[2];
-                const fp = args[3];
-                const pubKey = args[4];
-                hostKeysTable.set(`${assetId}:${algo}`, {
-                  id,
-                  asset_id: assetId,
-                  algorithm: algo,
-                  fingerprint: fp,
-                  public_key: pubKey,
-                  status: 'verified',
-                });
-              } else if (query.includes('UPDATE ssh_host_keys SET status =')) {
-                const id = args[0];
-                for (const row of hostKeysTable.values()) {
-                  if (row.id === id) row.status = 'changed';
-                }
-              } else if (query.includes('INSERT INTO audit_events')) {
-                auditEventsList.push({
-                  action: args[4],
-                  resource_type: args[5],
-                  resource_id: args[6],
-                  result: args[10],
-                  metadata: args[11] ? JSON.parse(args[11]) : null,
-                });
-              }
-              return { success: true };
-            },
-          };
-        },
-      };
-    },
-  };
-
-  const mockEnv: any = { DB: mockDb };
-  const session = new SSHSessionDO(undefined, mockEnv);
-
-  // Initialize session
-  await session.fetch(
-    new Request('http://localhost/init', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId: 'sess-tofu-test',
-        userId: 'usr_dev',
-        assetId: 'ast_server_01',
-        accountId: 'acc_root',
-        host: '198.51.100.10',
-        port: 22,
-        username: 'root',
-        authMethod: 'password',
-      }),
-    })
-  );
-
-  const mockKeyBlob = new Uint8Array([0, 0, 0, 11, ...new TextEncoder().encode('ssh-ed25519'), 0, 0, 0, 32, ...new Uint8Array(32).fill(9)]);
-  const initialFingerprint = 'SHA256:InitialValidFingerprint12345678901234567890';
-
-  // 1. First Connect: TOFU auto-records in D1 with status = 'verified' and emits HOST_KEY_TRUSTED
-  await (session as any).processHostKeyTOFU('ssh-ed25519', initialFingerprint, mockKeyBlob);
-
-  const savedKey = hostKeysTable.get('ast_server_01:ssh-ed25519');
-  assert.ok(savedKey);
-  assert.equal(savedKey.fingerprint, initialFingerprint);
-  assert.equal(savedKey.status, 'verified');
-
-  const trustedAudit = auditEventsList.find((a) => a.action === 'HOST_KEY_TRUSTED');
-  assert.ok(trustedAudit);
-  assert.equal(trustedAudit.result, 'success');
-  assert.equal(trustedAudit.metadata.fingerprint, initialFingerprint);
-
-  // 2. Reconnect with identical fingerprint: verified without errors
-  await (session as any).processHostKeyTOFU('ssh-ed25519', initialFingerprint, mockKeyBlob);
-  assert.equal(savedKey.status, 'verified');
-
-  // 3. Changed fingerprint (potential MITM attack): blocks connection, updates status to 'changed', emits HOST_KEY_CHANGED
-  const changedFingerprint = 'SHA256:MaliciousMitmFingerprint09876543210987654321';
-  await assert.rejects(
-    async () => {
-      await (session as any).processHostKeyTOFU('ssh-ed25519', changedFingerprint, mockKeyBlob);
-    },
-    (err: Error) => {
-      return err.message.includes('fingerprint changed') || err.message.includes('Security Alert');
-    }
-  );
-
-  // Status must be marked as 'changed'
-  assert.equal(savedKey.status, 'changed');
-
-  const changedAudit = auditEventsList.find((a) => a.action === 'HOST_KEY_CHANGED');
-  assert.ok(changedAudit);
-  assert.equal(changedAudit.result, 'failure');
-  assert.equal(changedAudit.metadata.expectedFingerprint, initialFingerprint);
-  assert.equal(changedAudit.metadata.actualFingerprint, changedFingerprint);
-
-  await session.terminate();
+test('tofu: persists first trust, blocks changes and preserves the trusted key', async () => {
+  const ctx = await createContext();
+  try {
+    const topo = await seedDemoTopology(ctx, 'test-private-key');
+    const actor = { actorUserId: topo.alice.id, sourceIp: '8.8.4.4' };
+    await verifyAssetHostKey(ctx.env, topo.prodWeb01.id, 'ssh-ed25519', 'SHA256:first', 'key1', actor);
+    await verifyAssetHostKey(ctx.env, topo.prodWeb01.id, 'ssh-ed25519', 'SHA256:first', 'key1', actor);
+    await assert.rejects(verifyAssetHostKey(ctx.env, topo.prodWeb01.id, 'ssh-ed25519', 'SHA256:changed', 'key2', actor));
+    const row = await ctx.db.prepare('SELECT * FROM ssh_host_keys WHERE asset_id = ?').bind(topo.prodWeb01.id).first<any>();
+    assert.equal(row.status, 'changed'); assert.equal(row.fingerprint, 'SHA256:first');
+    assert.equal(row.candidate_fingerprint, 'SHA256:changed');
+  } finally { await ctx.cleanup(); }
 });
 
 test('monitor: Read-only auditor watcher receives stdout and resize, and watcher input is ignored', async () => {

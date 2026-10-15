@@ -36,6 +36,7 @@ import {
 import { bytesToHex } from '../src/crypto/utils.ts';
 import { generateTotpCode } from '../src/crypto/totp.ts';
 import type { Env } from '../src/types.ts';
+import { createPasswordKdfNamespace } from './password-kdf-fixture.ts';
 
 function generateMasterKekHex(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -57,6 +58,7 @@ describe('Control Plane Services', () => {
       BOOTSTRAP_TOKEN: bootstrapToken,
       CREDENTIAL_KEK_V1: masterKek,
       AUTH_PEPPER: authPepper,
+      PASSWORD_KDF: createPasswordKdfNamespace(authPepper),
       SSH_SESSIONS: undefined as any,
       RATE_LIMIT: undefined as any,
       RECORDINGS: undefined as any,
@@ -151,13 +153,14 @@ describe('Control Plane Services', () => {
         assert.match(loginRes.cookie, /HttpOnly; Secure; SameSite=Strict/);
         assert.match(loginRes.cookie, /edgejump_session=/);
         assert.equal(loginRes.user.username, 'admin');
-        assert.ok(loginRes.permissions.includes('*'));
+        assert.deepEqual(loginRes.permissions, []);
+        assert.equal(loginRes.mfaSetupRequired, true);
 
         // Validate session
         const authUser = await validateSession(loginRes.sessionToken, db);
         assert.ok(authUser);
         assert.equal(authUser.username, 'admin');
-        assert.ok(authUser.permissions.has('*'));
+        assert.equal(authUser.mfaPending, true);
 
         // Logout revokes session
         const clearCookie = await logout(loginRes.sessionToken, db, authUser.id);

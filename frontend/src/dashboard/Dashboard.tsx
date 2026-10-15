@@ -1,16 +1,24 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../api/client';
-import { Server, Terminal, Shield, RefreshCw, Key, ChevronRight } from 'lucide-react';
+import { Server, Terminal, Shield, RefreshCw, Star, ChevronRight } from 'lucide-react';
+import { useAuth } from '../context/AuthContext';
+import { AssetTree } from '../assets/AssetTree';
+import type { AuthorizedAsset, AuthorizedAssetAccount, HistoricalSessionSummary } from '../../../src/shared/types';
 
 interface DashboardProps {
   onOpenTerminal: (sessionData: { sessionId: string; ticket: string; assetName: string; accountName: string }) => void;
 }
 
 export const Dashboard: React.FC<DashboardProps> = ({ onOpenTerminal }) => {
-  const [assets, setAssets] = useState<any[]>([]);
+  const { user, hasPermission } = useAuth();
+  const [assets, setAssets] = useState<AuthorizedAsset[]>([]);
+  const [sessions, setSessions] = useState<HistoricalSessionSummary[]>([]);
+  const [group, setGroup] = useState<string | null>(null);
+  const [favorites, setFavorites] = useState<string[]>(() => { try { return JSON.parse(localStorage.getItem(`edgejump:favorites:${user?.id}`) ?? '[]'); } catch { return []; } });
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [selectedAsset, setSelectedAsset] = useState<any | null>(null);
-  const [selectedAccount, setSelectedAccount] = useState<any | null>(null);
+  const [selectedAsset, setSelectedAsset] = useState<AuthorizedAsset | null>(null);
+  const [selectedAccount, setSelectedAccount] = useState<AuthorizedAssetAccount | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -19,6 +27,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTerminal }) => {
     try {
       const data = await api.getVisibleAssets();
       setAssets(data);
+      if (hasPermission('session.view_own')) setSessions(await api.listMySessions());
+      setError(null);
     } catch (err: any) {
       setError(err.message || '获取资产失败');
     } finally {
@@ -29,6 +39,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTerminal }) => {
   useEffect(() => {
     fetchAssets();
   }, []);
+
+  const groups = [...new Map(assets.flatMap((asset) => asset.groups ?? []).map((group) => [group.id, group])).values()];
+  const shown = assets.filter((asset) => (!group || asset.groups?.some((item) => item.id === group)) && (!favoritesOnly || favorites.includes(asset.id)));
+  function favorite(id: string) {
+    const next = favorites.includes(id) ? favorites.filter((item) => item !== id) : [...favorites, id];
+    setFavorites(next); localStorage.setItem(`edgejump:favorites:${user?.id}`, JSON.stringify(next));
+  }
 
   const handleStartConnect = async () => {
     if (!selectedAsset || !selectedAccount) return;
@@ -60,7 +77,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTerminal }) => {
               <span>已授权主机资产</span>
             </h1>
             <p className="text-slate-400 text-sm mt-1">
-              您当前仅能查看和连接经过堡垒机明确授权的主机与账号（基于 JumpServer 经典五要素权限模型）。
+              选择主机与 SSH 账号，开始终端会话。
             </p>
           </div>
 
@@ -93,8 +110,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTerminal }) => {
             </p>
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {assets.map((asset) => (
+          <div className="grid md:grid-cols-[220px_1fr] gap-5">
+            <aside className="bg-slate-800 rounded-xl p-5 self-start"><AssetTree groups={groups} assets={assets} selected={group} onGroup={setGroup} onAsset={(id) => { const asset = assets.find((asset) => asset.id === id)!; setSelectedAsset(asset); setSelectedAccount(asset.accounts[0]); }} /><button onClick={() => setFavoritesOnly(!favoritesOnly)} className={`mt-5 text-sm py-2 px-3 rounded-lg ${favoritesOnly ? 'bg-amber-600' : 'bg-slate-700'}`}>收藏资产</button></aside>
+            <div className="grid md:grid-cols-2 gap-4">
+            {!shown.length && <p className="p-8 text-slate-400 text-sm">暂无符合条件的资产</p>}
+            {shown.map((asset) => (
               <div
                 key={asset.id}
                 className="bg-slate-800 border border-slate-700 rounded-xl p-5 hover:border-blue-500/60 transition shadow-sm flex flex-col justify-between"
@@ -110,6 +130,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTerminal }) => {
                     <span className="text-xs bg-slate-700 text-slate-300 px-2 py-0.5 rounded font-mono">
                       {asset.platform}
                     </span>
+                    <button aria-label={`${favorites.includes(asset.id) ? '取消收藏' : '收藏'} ${asset.name}`} onClick={() => favorite(asset.id)} className="p-1 text-amber-400"><Star size={18} fill={favorites.includes(asset.id) ? 'currentColor' : 'none'} /></button>
                   </div>
 
                   {asset.description && (
@@ -143,8 +164,14 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTerminal }) => {
                 </button>
               </div>
             ))}
+            </div>
           </div>
         )}
+
+        {hasPermission('session.view_own') && <div className="mt-6 grid md:grid-cols-2 gap-5">{['在线会话', '最近会话'].map((title) => {
+          const rows = title === '在线会话' ? sessions.filter((session) => ['creating', 'connecting', 'active'].includes(session.status)) : sessions.slice(0, 5);
+          return <section key={title} className="bg-slate-800 rounded-xl p-5"><h2 className="font-medium mb-4">{title}</h2><div className="space-y-3">{rows.map((session) => <div key={session.id} className="flex justify-between gap-3 text-sm"><div>{session.assetName} / {session.accountName}<p className="text-slate-400 text-xs mt-1">{new Date(session.startedAt).toLocaleString()} · {session.status}</p></div>{['connecting', 'active'].includes(session.status) && <button onClick={async () => { try { onOpenTerminal({ ...await api.resumeSession(session.id), assetName: session.assetName, accountName: session.accountName }); } catch (error) { setError((error as Error).message); } }} className="text-blue-300">恢复终端</button>}</div>)}{!rows.length && <p className="text-sm text-slate-400">暂无记录</p>}</div></section>;
+        })}</div>}
 
         {/* Connect Modal */}
         {selectedAsset && (

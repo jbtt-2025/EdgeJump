@@ -56,6 +56,7 @@ export interface S3StorageConfig {
   region?: string;           // e.g. us-west-004 or auto
   accessKeyId: string;       // B2 keyID or AWS access key
   secretAccessKey: string;   // B2 applicationKey or AWS secret key
+  retries?: number;
 }
 
 /**
@@ -74,6 +75,7 @@ export class S3RecordingStorage implements RecordingStorage {
       secretAccessKey: config.secretAccessKey.trim(),
       service: 's3',
       region: config.region?.trim() || 'auto',
+      retries: config.retries,
     });
   }
 
@@ -96,6 +98,7 @@ export class S3RecordingStorage implements RecordingStorage {
     const body = typeof value === 'string' ? value : value;
     const response = await this.client.fetch(url, {
       method: 'PUT',
+      redirect: 'error',
       headers,
       body: body as any,
     });
@@ -108,7 +111,7 @@ export class S3RecordingStorage implements RecordingStorage {
 
   async get(key: string): Promise<StorageObject | null> {
     const url = this.getUrl(key);
-    const response = await this.client.fetch(url, { method: 'GET' });
+    const response = await this.client.fetch(url, { method: 'GET', redirect: 'error' });
 
     if (response.status === 404) {
       return null;
@@ -128,7 +131,7 @@ export class S3RecordingStorage implements RecordingStorage {
 
   async delete(key: string): Promise<void> {
     const url = this.getUrl(key);
-    const response = await this.client.fetch(url, { method: 'DELETE' });
+    const response = await this.client.fetch(url, { method: 'DELETE', redirect: 'error' });
     if (!response.ok && response.status !== 404) {
       const errText = await response.text().catch(() => '');
       throw new Error(`S3 DELETE "${key}" failed (HTTP ${response.status}): ${errText}`);
@@ -142,7 +145,7 @@ export class S3RecordingStorage implements RecordingStorage {
  * 2. Generic S3-compatible storage (env.S3_ENDPOINT, env.S3_BUCKET, etc.)
  * 3. None (null) -> recordings disabled
  */
-export function getRecordingStorage(env?: Env): RecordingStorage | null {
+export function getRecordingStorage(env?: Env, options: { retries?: number } = {}): RecordingStorage | null {
   if (!env) return null;
 
   // 1. Cloudflare Native R2
@@ -163,6 +166,7 @@ export function getRecordingStorage(env?: Env): RecordingStorage | null {
       region: env.S3_REGION || 'auto',
       accessKeyId: env.S3_ACCESS_KEY_ID,
       secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+      retries: options.retries,
     });
   }
 

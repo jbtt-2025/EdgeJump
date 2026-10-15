@@ -1,17 +1,19 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, lazy, Suspense } from 'react';
 import { useAuth } from './context/AuthContext';
 import { Navbar } from './components/Navbar';
-import { Login } from './pages/Login';
-import { Dashboard } from './pages/Dashboard';
-import { Terminal } from './pages/Terminal';
-import { Admin } from './pages/Admin';
-import { Audit } from './pages/Audit';
-import { LiveMonitor } from './pages/LiveMonitor';
+import { Login } from './auth/Login';
+import { Dashboard } from './dashboard/Dashboard';
+const Terminal = lazy(() => import('./terminal/Terminal').then((module) => ({ default: module.Terminal })));
+const Admin = lazy(() => import('./admin/Admin').then((module) => ({ default: module.Admin })));
+const Audit = lazy(() => import('./audit/Audit').then((module) => ({ default: module.Audit })));
+const LiveMonitor = lazy(() => import('./audit/LiveMonitor').then((module) => ({ default: module.LiveMonitor })));
 import { Shield } from 'lucide-react';
+import { MfaSettings } from './auth/MfaSettings';
+import { MySessions } from './sessions/MySessions';
 
-export const App: React.FC = () => {
+const Application: React.FC = () => {
   const { user, loading } = useAuth();
-  const [currentTab, setCurrentTab] = useState<'dashboard' | 'admin' | 'audit'>('dashboard');
+  const [currentTab, setCurrentTab] = useState<'dashboard' | 'admin' | 'audit' | 'sessions' | 'security'>('dashboard');
 
   // Terminal active session
   const [activeSession, setActiveSession] = useState<{
@@ -28,6 +30,8 @@ export const App: React.FC = () => {
     accountName: string;
   } | null>(null);
 
+  useEffect(() => { setActiveSession(null); setMonitorSession(null); setCurrentTab('dashboard'); }, [user?.id]);
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-950 text-slate-400">
@@ -39,6 +43,7 @@ export const App: React.FC = () => {
   if (!user) {
     return <Login />;
   }
+  if (user.mfaPending || currentTab === 'security') return <MfaSettings onDone={() => setCurrentTab('dashboard')} />;
 
   if (activeSession) {
     return (
@@ -72,6 +77,7 @@ export const App: React.FC = () => {
       )}
 
       {currentTab === 'admin' && <Admin />}
+      {currentTab === 'sessions' && <MySessions onOpenTerminal={setActiveSession} />}
 
       {currentTab === 'audit' && (
         <Audit onOpenMonitor={(s) => setMonitorSession(s)} />
@@ -79,3 +85,5 @@ export const App: React.FC = () => {
     </div>
   );
 };
+
+export const App: React.FC = () => <Suspense fallback={<div role="status" className="min-h-screen bg-slate-950 p-8 text-slate-300">Loading...</div>}><Application /></Suspense>;

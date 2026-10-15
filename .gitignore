@@ -7,6 +7,10 @@ dist/
 .wrangler/
 *.generated.toml
 .wrangler.generated.toml
+test-results/
+playwright-report/
+docs/
+.kiro/
 
 # Environment and secrets
 .env

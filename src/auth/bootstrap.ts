@@ -1,6 +1,7 @@
 import type { Env, UserRow } from '../types.ts';
 import type { UserSummary } from '../shared/types.ts';
-import { hashPassword, DEFAULT_PBKDF2_ITERATIONS, PASSWORD_ALGORITHM } from '../crypto/password.ts';
+import { PASSWORD_ALGORITHM } from '../crypto/password.ts';
+import { hashUserPassword } from './password-service.ts';
 import { recordAuditEvent } from '../audit/audit-service.ts';
 
 export interface BootstrapInput {
@@ -10,6 +11,7 @@ export interface BootstrapInput {
   displayName?: string;
   email?: string;
   clientIp?: string;
+  userAgent?: string;
 }
 
 /**
@@ -68,6 +70,7 @@ export async function bootstrapSuperAdmin(
         action: 'BOOTSTRAP_FAILED',
         resourceType: 'system',
         sourceIp: input.clientIp ?? '127.0.0.1',
+        userAgent: input.userAgent,
         result: 'denied',
         metadata: { reason: 'Invalid or missing bootstrap token' },
       },
@@ -86,9 +89,8 @@ export async function bootstrapSuperAdmin(
   }
 
   const now = Date.now();
-  const userId = `user_${crypto.randomUUID()}`;
-  const pepper = env.AUTH_PEPPER || '';
-  const hashedPassword = await hashPassword(input.password, pepper, DEFAULT_PBKDF2_ITERATIONS);
+  const userId = `usr_${crypto.randomUUID()}`;
+  const hashedPassword = await hashUserPassword(userId, input.password, env);
 
   const passwordParams = JSON.stringify({ iterations: hashedPassword.iterations });
 
@@ -139,6 +141,7 @@ export async function bootstrapSuperAdmin(
       resourceId: userId,
       resourceName: username,
       sourceIp: input.clientIp ?? '127.0.0.1',
+      userAgent: input.userAgent,
       result: 'success',
       metadata: { role: 'role_super_admin' },
     },

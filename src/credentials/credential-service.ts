@@ -1,6 +1,6 @@
-import type { CredentialType, CredentialRow } from '../types.ts';
+import type { CredentialType, CredentialRow, Env } from '../types.ts';
 import type { CredentialSummary } from '../shared/types.ts';
-import { encryptCredential, decryptCredential } from '../crypto/envelope.ts';
+import { encryptCredential, decryptCredential, rotateCredentialKey } from '../crypto/envelope.ts';
 
 export interface CreateCredentialInput {
   name: string;
@@ -53,9 +53,9 @@ export async function createCredential(
         id, name, type,
         credential_ciphertext, credential_nonce,
         encrypted_dek, dek_nonce,
-        key_version, algorithm,
+        key_version, credential_key_version, algorithm,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
@@ -65,6 +65,7 @@ export async function createCredential(
       encryptedBlob.credentialNonce,
       encryptedBlob.encryptedDek,
       encryptedBlob.dekNonce,
+      keyVersion,
       keyVersion,
       'AES-256-GCM',
       now,
@@ -128,6 +129,7 @@ export async function replaceCredential(
         encrypted_dek = ?,
         dek_nonce = ?,
         key_version = ?,
+        credential_key_version = ?,
         updated_at = ?
       WHERE id = ?`
     )
@@ -136,6 +138,7 @@ export async function replaceCredential(
       encryptedBlob.credentialNonce,
       encryptedBlob.encryptedDek,
       encryptedBlob.dekNonce,
+      keyVersion,
       keyVersion,
       now,
       id
@@ -243,6 +246,7 @@ export async function getDecryptedCredential(
       encryptedDek: row.encrypted_dek,
       dekNonce: row.dek_nonce,
       keyVersion: row.key_version,
+      credentialKeyVersion: row.credential_key_version,
       type: row.type,
     },
     row.id,
@@ -254,4 +258,31 @@ export async function getDecryptedCredential(
     type: row.type,
     name: row.name,
   };
+}
+
+export function getCredentialKek(env: Env, version: string): string {
+  const key = version === 'v1' ? env.CREDENTIAL_KEK_V1 : version === 'v2' ? env.CREDENTIAL_KEK_V2 : undefined;
+  if (!key) throw new Error('Credential encryption key version is not configured');
+  return key;
+}
+
+export async function getSessionCredential(id: string, env: Env) {
+  const row = await env.DB.prepare('SELECT key_version FROM credentials WHERE id = ?')
+    .bind(id).first<{ key_version: string }>();
+  if (!row) throw new Error('Credential not found');
+  return getDecryptedCredential(id, getCredentialKek(env, row.key_version), env.DB);
+}
+
+export async function rewrapCredential(id: string, version: string, env: Env): Promise<void> {
+  const row = await env.DB.prepare('SELECT * FROM credentials WHERE id = ?').bind(id).first<CredentialRow>();
+  if (!row) throw new Error('Credential not found');
+  const blob = await rotateCredentialKey({
+    type: row.type, credentialCiphertext: row.credential_ciphertext,
+    credentialNonce: row.credential_nonce, encryptedDek: row.encrypted_dek,
+    dekNonce: row.dek_nonce, keyVersion: row.key_version,
+    credentialKeyVersion: row.credential_key_version,
+  }, id, getCredentialKek(env, row.key_version), getCredentialKek(env, version), version);
+  await env.DB.prepare(`UPDATE credentials SET encrypted_dek = ?, dek_nonce = ?, key_version = ?,
+    credential_key_version = ?, updated_at = ? WHERE id = ?`)
+    .bind(blob.encryptedDek, blob.dekNonce, version, blob.credentialKeyVersion, Date.now(), id).run();
 }

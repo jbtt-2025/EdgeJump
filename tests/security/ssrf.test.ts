@@ -8,7 +8,7 @@ import {
   createTicket,
   verifyTicket,
   toSocketHostname,
-} from '../src/backend/security.ts';
+} from '../../src/backend/security.ts';
 
 test('isPrivateAddress detects RFC 1918 private IPv4 ranges', () => {
   // 10.0.0.0/8

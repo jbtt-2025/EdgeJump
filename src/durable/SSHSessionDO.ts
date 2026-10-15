@@ -37,6 +37,8 @@ import {
   encodeString,
   toBase64,
   toBufferSource,
+  readUint32,
+  writeUint32,
 } from '../ssh/utils.ts';
 import {
   SSH_MSG_KEXINIT,
@@ -57,6 +59,9 @@ import {
   SSH_MSG_DEBUG,
   SSH_MSG_IGNORE,
   SSH_MSG_GLOBAL_REQUEST,
+  SSH_MSG_REQUEST_FAILURE,
+  SSH_MSG_REQUEST_SUCCESS,
+  SSH_MSG_CHANNEL_REQUEST,
   getCipherSpec,
   getMacSpec,
   normalizeTerminalSize,
@@ -65,6 +70,13 @@ import {
 import { SessionRecorder } from './recording.ts';
 import { CommandHeuristicsTracker } from './heuristics.ts';
 import { getRecordingStorage } from '../storage/recording-storage.ts';
+import { assertPublicTarget, toSocketHostname, createTicket, verifyTicket } from '../backend/security.ts';
+import { verifyAssetHostKey } from '../assets/host-key-verification.ts';
+import { checkUserAssetAccountAccess } from '../authorization/authorization-service.ts';
+import { getSessionCredential } from '../credentials/credential-service.ts';
+import { getAllSettings } from '../settings/settings-service.ts';
+import { recordAuditEvent as writeAuditEvent } from '../audit/audit-service.ts';
+import { logError } from '../logging.ts';
 
 export interface TCPSocket {
   readable: ReadableStream<Uint8Array>;
@@ -92,7 +104,7 @@ export interface SSHSessionInitConfig {
   host: string;
   port: number;
   username: string; // SSH username on target
-  authMethod: 'password' | 'publickey';
+  authMethod?: 'password' | 'publickey';
   password?: string;
   privateKey?: string;
   sourceIp?: string;
@@ -100,6 +112,9 @@ export interface SSHSessionInitConfig {
   cols?: number;
   rows?: number;
   term?: string;
+  ticket?: string;
+  expiresAt?: number;
+  createdAt?: number;
 }
 
 // Simple fallback WebSocketPair for Node test environments
@@ -147,9 +162,31 @@ export class SSHSessionDO {
   private clientClosed: boolean = false;
   private disconnectReason: string | null = null;
   private terminatedBy: string | null = null;
+  private terminationActor: { username?: string; sourceIp?: string; userAgent?: string | null } = {};
+  private createdAt = Date.now();
+  private lastActivityAt = Date.now();
+  private disconnectOnBrowserClose = true;
+  private connectionStarted = false;
+  private restoring: Promise<void> | null = null;
+  private closing: Promise<void> | null = null;
+  private closeAudited = false;
+  private endedAt: number | null = null;
+  private exitCode: number | null = null;
+  private exitSignal: string | null = null;
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+  private keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+  private keepaliveOutstanding = 0;
+  private readonly outputDecoder = new TextDecoder();
+  private transferTails: Record<string, string> = {};
 
   // Single-use tickets
   private readonly validTickets: Map<string, number> = new Map();
+  private readonly consumedTickets = new Set<string>();
+  private sendQueue: Promise<void> = Promise.resolve();
+  private pendingInput = new Uint8Array(0);
+  private inputQueue: Promise<void> = Promise.resolve();
+  private sendBlockSize = 8;
+  private sendAead = false;
 
   // WebSockets
   private userWebSocket: WebSocket | null = null;
@@ -160,8 +197,8 @@ export class SSHSessionDO {
   private heuristics: CommandHeuristicsTracker | null = null;
 
   // Timers
-  private readonly idleTimeoutMs: number = 30 * 60 * 1000;      // 30 min default
-  private readonly maxDurationMs: number = 8 * 60 * 60 * 1000;  // 8 hours default
+  private idleTimeoutMs: number = 30 * 60 * 1000;
+  private maxDurationMs: number = 8 * 60 * 60 * 1000;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private maxDurationTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -214,13 +251,17 @@ export class SSHSessionDO {
     const path = url.pathname;
 
     try {
+      if (!this.config && this.state?.storage) {
+        this.restoring ??= this.restoreSession();
+        try { await this.restoring; } finally { this.restoring = null; }
+      }
       if (request.method === 'POST' && path === '/init') {
         const body = (await request.json()) as SSHSessionInitConfig;
         return await this.handleInit(body);
       }
 
       if (request.method === 'POST' && path === '/ticket') {
-        return this.handleCreateTicket();
+        return await this.handleCreateTicket(request);
       }
 
       if (request.method === 'GET' && path === '/connect') {
@@ -232,8 +273,11 @@ export class SSHSessionDO {
       }
 
       if (request.method === 'POST' && path === '/terminate') {
-        const body = (await request.json().catch(() => ({}))) as { reason?: string; actorId?: string };
-        await this.terminate(body.reason || 'terminated_by_admin', body.actorId);
+        const body = await request.json<any>();
+        this.terminationActor = { username: body.actorUsername, sourceIp: body.sourceIp, userAgent: body.userAgent };
+        this.clientClosed = body.clientClosed === true;
+        if (this.clientClosed) await this.handleSessionClose('closed', 'client_disconnected');
+        else await this.terminate(body.reason || 'terminated_by_admin', body.actorId);
         return Response.json({ success: true, status: this.status });
       }
 
@@ -243,49 +287,109 @@ export class SSHSessionDO {
           status: this.status,
           watchersCount: this.watchers.size,
           startedAt: this.startedAt,
+          createdAt: this.createdAt,
+          lastActivityAt: this.lastActivityAt,
+          pty: { cols: this.config?.cols ?? 80, rows: this.config?.rows ?? 24, term: this.config?.term ?? 'xterm-256color' },
           disconnectReason: this.disconnectReason,
         });
       }
 
       return Response.json({ error: 'Endpoint not found' }, { status: 404 });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return Response.json({ error: message }, { status: 500 });
+      logError('session_request_failed', err);
+      return Response.json({ error: 'Session operation failed' }, { status: 500 });
     }
   }
 
   // --- Admin Endpoints ---
 
+  private async restoreSession(): Promise<void> {
+    const saved = await this.state?.storage.get<SSHSessionInitConfig>('config');
+    if (!saved || this.config) return;
+    const row = await this.env?.DB.prepare('SELECT status FROM ssh_sessions WHERE id = ?')
+      .bind(saved.sessionId).first<{ status: SessionStatus }>();
+    if (!row) throw new Error('Session metadata is unavailable');
+    this.config = saved;
+    this.sessionId = saved.sessionId!;
+    this.createdAt = saved.createdAt ?? Date.now();
+    this.status = row.status;
+    if (!['creating', 'connecting', 'active'].includes(row.status)) {
+      this.isTerminated = true;
+      this.closeAudited = true;
+      return;
+    }
+    // TCP and SSH cipher state cannot survive an isolate restart. Never reconnect
+    // an old session or overwrite its existing recording chunks.
+    if (row.status === 'active' || await this.state?.storage.get('connectionStarted')) {
+      await this.handleSessionClose('failed', 'runtime_restarted');
+      return;
+    }
+    await this.loadSessionSettings();
+    this.recorder = new SessionRecorder(this.sessionId, getRecordingStorage(this.env), this.createdAt);
+    this.heuristics = new CommandHeuristicsTracker(this.sessionId, this.env?.DB);
+    this.startTimers();
+  }
+
   private async handleInit(config: SSHSessionInitConfig): Promise<Response> {
+    if (this.config) return Response.json({ error: 'Session already initialized' }, { status: 409 });
+    if (!config.sessionId || !config.userId || !config.assetId || !config.accountId || !config.host) {
+      return Response.json({ error: 'Invalid session initialization' }, { status: 400 });
+    }
     this.config = config;
     this.sessionId = config.sessionId || (this.state?.id ? this.state.id.toString() : crypto.randomUUID());
     this.status = 'connecting';
+    this.createdAt = config.createdAt ?? Date.now();
+    this.lastActivityAt = this.createdAt;
+    await this.loadSessionSettings();
 
     const storage = getRecordingStorage(this.env);
     this.recorder = new SessionRecorder(this.sessionId, storage);
     this.heuristics = new CommandHeuristicsTracker(this.sessionId, this.env?.DB);
 
-    // Initial record in D1 ssh_sessions
+    // The Worker owns creation; the DO updates the same metadata record.
     await this.persistSessionCreated();
+    const { password, privateKey, ticket, expiresAt, ...metadata } = config;
+    await this.state?.storage?.put('config', metadata);
+    if (ticket && expiresAt) await this.registerTicket(ticket, expiresAt);
+    this.config.ticket = undefined;
+    this.startTimers();
 
     return Response.json({ success: true, sessionId: this.sessionId });
   }
 
-  private handleCreateTicket(): Response {
-    const ticket = crypto.randomUUID();
-    const expiresAt = Date.now() + 60_000; // 60-second single-use ticket
+  private async loadSessionSettings(): Promise<void> {
+    if (!this.env?.DB) return;
+    const settings = await getAllSettings(this.env.DB);
+    this.idleTimeoutMs = Number(settings.session_idle_timeout) * 1000;
+    this.maxDurationMs = Number(settings.session_max_duration) * 1000;
+    this.disconnectOnBrowserClose = settings.disconnect_on_browser_close !== 'false';
+  }
+
+  private async registerTicket(ticket: string, expiresAt: number): Promise<void> {
     this.validTickets.set(ticket, expiresAt);
+    await this.state?.storage?.put(`ticket:${ticket}`, expiresAt);
+  }
+
+  private async handleCreateTicket(request: Request): Promise<Response> {
+    if (!this.config || this.isTerminated || request.headers.get('x-user-id') !== this.config.userId || !this.env?.SESSION_TICKET_SECRET) {
+      return new Response('Permission denied', { status: 403 });
+    }
+    const { ticket, expiresAt } = await createTicket(new TextEncoder().encode(this.env.SESSION_TICKET_SECRET), '', {
+      sessionId: this.sessionId, userId: this.config.userId, assetId: this.config.assetId, accountId: this.config.accountId,
+    });
+    await this.registerTicket(ticket, expiresAt);
     return Response.json({ ticket, expiresAt });
   }
 
   private async handleConnectUpgrade(request: Request, url: URL): Promise<Response> {
-    const ticket = url.searchParams.get('ticket');
-    if (!ticket || !this.validTickets.has(ticket)) {
+    const ticket = request.headers.get('x-session-ticket') ?? url.searchParams.get('ticket');
+    if (!this.config || this.isTerminated || this.userWebSocket || request.headers.get('x-user-id') !== this.config.userId ||
+      !ticket || !this.env?.SESSION_TICKET_SECRET ||
+      !await verifyTicket(new TextEncoder().encode(this.env.SESSION_TICKET_SECRET), ticket)) {
       return new Response('Invalid or expired ticket', { status: 403 });
     }
-    const expiry = this.validTickets.get(ticket)!;
-    this.validTickets.delete(ticket); // Single use
-    if (Date.now() > expiry) {
+    const expiry = this.validTickets.get(ticket) ?? await this.state?.storage?.get<number>(`ticket:${ticket}`);
+    if (!expiry || Date.now() >= expiry || this.consumedTickets.has(ticket)) {
       return new Response('Ticket expired', { status: 403 });
     }
 
@@ -293,6 +397,10 @@ export class SSHSessionDO {
     if (upgradeHeader !== 'websocket') {
       return new Response('Expected WebSocket Upgrade', { status: 426 });
     }
+    // Consume before creating the socket and before any further await.
+    this.consumedTickets.add(ticket);
+    this.validTickets.delete(ticket);
+    await this.state?.storage?.delete(`ticket:${ticket}`);
 
     const PairClass = typeof WebSocketPair !== 'undefined' ? WebSocketPair : FallbackWebSocketPair;
     const pair = new PairClass();
@@ -300,21 +408,26 @@ export class SSHSessionDO {
 
     serverWs.accept();
     this.setupUserWebSocket(serverWs);
+    if (this.status === 'active') serverWs.send(JSON.stringify({ type: 'status', status: 'active' }));
 
     // If SSH connection has not yet begun, initiate it in the background
-    if (!this.socket && this.config) {
-      this.startSSHConnection().catch(async (err) => {
-        console.error(`[SSHSessionDO] SSH connection failed:`, err);
-        const errMsg = `\r\n\x1b[31m[EdgeJump] Connection error: ${err instanceof Error ? err.message : String(err)}\x1b[0m\r\n`;
-        this.userWebSocket?.send(errMsg);
-        await this.handleSessionClose('failed', err instanceof Error ? err.message : String(err));
-      });
+    if (!this.connectionStarted && this.config) {
+      this.connectionStarted = true;
+      const connecting = this.startSSHConnection().catch(async (err) => {
+        if (this.isTerminated) return;
+        logError('ssh_connection_failed', err);
+        const errMsg = '\r\n[EdgeJump] SSH connection failed. Contact your administrator.\r\n';
+        try { this.userWebSocket?.send(errMsg); } catch {}
+        await this.handleSessionClose('failed', 'ssh_connection_failed');
+      }).catch((error) => logError('session_finalization_failed', error));
+      this.state?.waitUntil?.(connecting);
     }
 
     return this.createWebSocketUpgradeResponse(clientWs);
   }
 
   private async handleMonitorUpgrade(request: Request): Promise<Response> {
+    if (!this.config || this.isTerminated) return new Response('Session is offline', { status: 409 });
     const upgradeHeader = request.headers.get('Upgrade');
     if (upgradeHeader !== 'websocket') {
       return new Response('Expected WebSocket Upgrade', { status: 426 });
@@ -356,9 +469,11 @@ export class SSHSessionDO {
               const msg = JSON.parse(event.data);
               if (msg.type === 'resize' && typeof msg.cols === 'number' && typeof msg.rows === 'number') {
                 const norm = normalizeTerminalSize(msg.cols, msg.rows);
-                if (norm && this.channel && this.channel.isOpen()) {
-                  await this.sendPacket(this.channel.buildWindowChange(norm.cols, norm.rows));
-                  this.recorder?.recordEvent('resize', undefined, { cols: norm.cols, rows: norm.rows });
+                if (norm && this.config) {
+                  this.config!.cols = norm.cols;
+                  this.config!.rows = norm.rows;
+                  if (this.channel?.isOpen()) await this.sendPacket(this.channel.buildWindowChange(norm.cols, norm.rows));
+                  await this.recorder?.recordEvent('resize', undefined, { cols: norm.cols, rows: norm.rows });
                   this.broadcastToWatchers(JSON.stringify({ type: 'resize', cols: norm.cols, rows: norm.rows }));
                 }
                 return;
@@ -377,25 +492,28 @@ export class SSHSessionDO {
           await this.forwardTerminalInput(bytes);
         }
       } catch (err) {
-        console.error('[SSHSessionDO] Error handling terminal stdin:', err);
+        logError('[SSHSessionDO] Error handling terminal stdin:', err);
       }
     });
 
     ws.addEventListener('close', async () => {
       this.clientClosed = true;
       this.userWebSocket = null;
-      await this.handleSessionClose('closed', 'client_closed');
+      if (this.disconnectOnBrowserClose) await this.handleSessionClose('closed', 'client_closed')
+        .catch((error) => logError('client_close_finalization_failed', error));
     });
 
     ws.addEventListener('error', async () => {
       this.clientClosed = true;
       this.userWebSocket = null;
-      await this.handleSessionClose('closed', 'websocket_error');
+      if (this.disconnectOnBrowserClose) await this.handleSessionClose('closed', 'websocket_error')
+        .catch((error) => logError('websocket_error_finalization_failed', error));
     });
   }
 
   private setupWatcherWebSocket(ws: WebSocket): void {
     this.watchers.add(ws);
+    ws.send(JSON.stringify({ type: 'resize', cols: this.config?.cols ?? 80, rows: this.config?.rows ?? 24 }));
 
     // Watcher input is strictly ignored per AGENTS.md and requirements
     ws.addEventListener('message', () => {
@@ -425,16 +543,25 @@ export class SSHSessionDO {
 
   private async forwardTerminalInput(data: Uint8Array): Promise<void> {
     if (!this.channel || !this.channel.isOpen()) return;
+    if (await this.rejectFileTransfer(data, 'upload')) return;
 
     // Command heuristics tracker: reconstructs lines, detects sensitive prompts, redacts passwords
     this.heuristics?.feedStdin(data);
 
-    // Write data to SSH shell channel in chunks respecting remote window & packet size
+    this.pendingInput = concat(this.pendingInput, data) as Uint8Array<ArrayBuffer>;
+    if (this.pendingInput.length > 1024 * 1024) throw new Error('Terminal input buffer exceeded');
+    await this.flushTerminalInput();
+  }
+
+  private async flushTerminalInput(): Promise<void> {
+    const task = this.inputQueue.then(async () => {
+    if (!this.channel?.isOpen()) return;
+    const data = this.pendingInput;
+    this.pendingInput = new Uint8Array(0);
     let offset = 0;
     while (offset < data.length) {
       const chunk = this.channel.takeChannelDataChunk(data, offset);
       if (!chunk) {
-        // Window exhausted, small yield or break
         break;
       }
       const payload = new Uint8Array(chunk.payloadLength);
@@ -442,19 +569,44 @@ export class SSHSessionDO {
       offset += chunk.bytesConsumed;
       await this.sendPacket(payload);
     }
+    this.pendingInput = concat(data.subarray(offset), this.pendingInput) as Uint8Array<ArrayBuffer>;
+    });
+    this.inputQueue = task.catch(() => {});
+    await task;
+  }
+
+  private async rejectFileTransfer(data: Uint8Array, direction: string): Promise<boolean> {
+    const text = (this.transferTails[direction] ?? '') + new TextDecoder('latin1').decode(data);
+    this.transferTails[direction] = text.slice(-8);
+    if (!/\x18[ABC]/.test(text)) return false;
+    await this.recordAuditEvent('FILE_TRANSFER_DENIED', 'session', this.sessionId, 'denied', {
+      assetId: this.config?.assetId, accountId: this.config?.accountId, direction,
+      path: null, size: data.length, reason: 'file_transfer_disabled',
+    });
+    await this.handleSessionClose('closed', 'file_transfer_disabled');
+    return true;
   }
 
   // --- Session Timers ---
 
   private resetIdleTimer(): void {
-    if (this.idleTimer) clearTimeout(this.idleTimer);
-    if (this.isTerminated) return;
+    this.lastActivityAt = Date.now();
+    // Traffic only updates a timestamp. Re-arm once when the existing deadline fires.
+    if (this.idleTimer || this.isTerminated) return;
+    this.scheduleIdleCheck(this.idleTimeoutMs);
+  }
 
+  private scheduleIdleCheck(delayMs: number): void {
     this.idleTimer = setTimeout(() => {
-      this.handleSessionClose('timeout', 'idle_timeout').catch((err) =>
-        console.error('[SSHSessionDO] Idle timeout cleanup failed:', err)
+      this.idleTimer = null;
+      if (this.isTerminated) return;
+      const remaining = this.lastActivityAt + this.idleTimeoutMs - Date.now();
+      if (remaining > 0) this.scheduleIdleCheck(remaining);
+      else this.handleSessionClose('timeout', 'idle_timeout').catch((err) =>
+        logError('[SSHSessionDO] Idle timeout cleanup failed:', err)
       );
-    }, this.idleTimeoutMs);
+    }, Math.max(1, delayMs));
+    (this.idleTimer as any).unref?.();
   }
 
   private startTimers(): void {
@@ -463,12 +615,15 @@ export class SSHSessionDO {
     if (this.maxDurationTimer) clearTimeout(this.maxDurationTimer);
     this.maxDurationTimer = setTimeout(() => {
       this.handleSessionClose('timeout', 'max_duration_timeout').catch((err) =>
-        console.error('[SSHSessionDO] Max duration timeout cleanup failed:', err)
+        logError('[SSHSessionDO] Max duration timeout cleanup failed:', err)
       );
-    }, this.maxDurationMs);
+    }, Math.max(1, this.maxDurationMs - (Date.now() - this.createdAt)));
+    (this.maxDurationTimer as any).unref?.();
   }
 
   private clearTimers(): void {
+    if (this.handshakeTimer) clearTimeout(this.handshakeTimer);
+    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
     if (this.idleTimer) {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
@@ -520,15 +675,21 @@ export class SSHSessionDO {
   }
 
   private async sendPacket(payload: Uint8Array): Promise<void> {
+    const task = this.sendQueue.then(() => this.writePacket(payload));
+    this.sendQueue = task.catch(() => {});
+    return task;
+  }
+
+  private async writePacket(payload: Uint8Array): Promise<void> {
     if (!this.socketWriter) throw new Error('TCP writer not initialized');
 
     const packet = await SSHPacketBuilder.build(
       payload,
-      this.blockSize,
-      this.encryptFn ? this.encryptFn.bind(this) : null,
+      this.sendBlockSize,
+      this.encryptCipher ? this.encryptFn.bind(this) : null,
       this.clientSeqNum,
-      this.isAead,
-      this.macFn ? this.macFn.bind(this) : undefined
+      this.sendAead,
+      this.hmacC2S ? this.macFn.bind(this) : undefined
     );
     this.clientSeqNum = nextSequenceNumber(this.clientSeqNum);
     await this.socketWriter.write(packet);
@@ -557,10 +718,28 @@ export class SSHSessionDO {
   // --- SSH Handshake & Lifecycle ---
 
   private async startSSHConnection(): Promise<void> {
+    await this.state?.storage?.put('connectionStarted', true);
+    const timeout = Number(this.env?.CONNECT_TIMEOUT_MS || 30_000);
+    this.handshakeTimer = setTimeout(() => {
+      void this.handleSessionClose('failed', 'connection_timeout').catch((err) => logError('connection_timeout_cleanup', err));
+    }, timeout);
+    (this.handshakeTimer as any).unref?.();
+    try {
+      await this.establishSSHConnection();
+    } finally {
+      if (this.handshakeTimer) clearTimeout(this.handshakeTimer);
+      if (this.config) { this.config.password = undefined; this.config.privateKey = undefined; }
+    }
+  }
+
+  private async establishSSHConnection(): Promise<void> {
     if (!this.config) throw new Error('SSHSessionDO has not been initialized');
 
     const { host, port } = this.config;
-    this.socket = await this.connectSocket(host, port);
+    const [address] = await assertPublicTarget(host, port);
+    if (this.isTerminated) return;
+    this.socket = await this.connectSocket(toSocketHostname(address), port);
+    if (this.isTerminated) { await this.socket.close(); return; }
     this.socketReader = this.socket.readable.getReader();
     this.socketWriter = this.socket.writable.getWriter();
 
@@ -694,34 +873,34 @@ export class SSHSessionDO {
       await encGcm.init();
       this.encryptCipher = encGcm;
 
-      const decGcm = new SSHAESGCMCipher(keys.encKeyServerToClient, keys.ivServerToClient);
-      await decGcm.init();
-      this.decryptCipher = decGcm;
-
-      this.blockSize = 16;
-      this.isAead = true;
-      this.macLength = 0;
     } else {
       const encCtr = new SSHAESCTRCipher(keys.encKeyClientToServer, keys.ivClientToServer);
       await encCtr.init();
       this.encryptCipher = encCtr;
 
-      const decCtr = new SSHAESCTRCipher(keys.encKeyServerToClient, keys.ivServerToClient);
-      await decCtr.init();
-      this.decryptCipher = decCtr;
-
       const hmacC = new SSHHMAC(negotiatedMacC2S, keys.integrityKeyC2S);
       await hmacC.init();
       this.hmacC2S = hmacC;
 
+    }
+    if (cipherSpecS2C.aead) {
+      const decGcm = new SSHAESGCMCipher(keys.encKeyServerToClient, keys.ivServerToClient);
+      await decGcm.init();
+      this.decryptCipher = decGcm;
+    } else {
+      const decCtr = new SSHAESCTRCipher(keys.encKeyServerToClient, keys.ivServerToClient);
+      await decCtr.init();
+      this.decryptCipher = decCtr;
       const hmacS = new SSHHMAC(negotiatedMacS2C, keys.integrityKeyS2C);
       await hmacS.init();
       this.hmacS2C = hmacS;
 
-      this.blockSize = 16;
-      this.isAead = false;
       this.macLength = hmacS.length;
     }
+    this.sendBlockSize = cipherSpecC2S.blockSize;
+    this.sendAead = cipherSpecC2S.aead;
+    this.blockSize = cipherSpecS2C.blockSize;
+    this.isAead = cipherSpecS2C.aead;
 
     // 7. Service Request (ssh-userauth)
     const serviceReq = concat(new Uint8Array([SSH_MSG_SERVICE_REQUEST]), encodeString('ssh-userauth'));
@@ -737,6 +916,19 @@ export class SSHSessionDO {
     }
 
     // 8. User Authentication & Credential Cleanup
+    if (this.isTerminated) return;
+    if (this.env?.DB) {
+      const access = await checkUserAssetAccountAccess(this.config.userId, this.config.assetId, this.config.accountId, 'connect', this.env.DB);
+      if (!access.authorized) throw new Error('Access denied before SSH authentication');
+      const account = await this.env.DB.prepare('SELECT credential_id FROM asset_accounts WHERE id = ?').bind(this.config.accountId)
+        .first<{ credential_id: string }>();
+      if (!account) throw new Error('Account not found');
+      const credential = await getSessionCredential(account.credential_id, this.env);
+      this.config.authMethod = credential.type === 'password' ? 'password' : 'publickey';
+      if (credential.type === 'password') this.config.password = credential.plaintext;
+      else this.config.privateKey = credential.plaintext;
+      credential.plaintext = '';
+    }
     const authMethod = this.config.authMethod;
     if (authMethod === 'password') {
       const password = this.config.password || '';
@@ -817,20 +1009,34 @@ export class SSHSessionDO {
     }
 
     // 10. Session Activated!
+    if (this.isTerminated) return;
     this.status = 'active';
     this.startedAt = Date.now();
 
-    this.recorder?.recordEvent('connect', undefined, { cols, rows });
+    await this.recorder?.recordEvent('connect', undefined, { cols, rows });
     await this.updateSessionStatusInD1('active');
     await this.recordAuditEvent('SESSION_CONNECTED', 'ssh_session', this.sessionId, 'success');
+    this.userWebSocket?.send(JSON.stringify({ type: 'status', status: 'active' }));
 
     this.startTimers();
+    this.keepaliveTimer = setInterval(() => {
+      if (this.keepaliveOutstanding >= 3) {
+        void this.handleSessionClose('timeout', 'keepalive_timeout').catch((error) => logError('keepalive_finalization_failed', error));
+        return;
+      }
+      this.keepaliveOutstanding++;
+      void this.sendPacket(concat(new Uint8Array([SSH_MSG_GLOBAL_REQUEST]), encodeString('keepalive@openssh.com'), new Uint8Array([1])))
+        .catch((err) => logError('keepalive_failed', err));
+    }, 25_000);
+    (this.keepaliveTimer as any).unref?.();
 
     // Start background receive loop from SSH server
-    this.runChannelLoop().catch(async (err) => {
-      console.error('[SSHSessionDO] Channel loop terminated with error:', err);
-      await this.handleSessionClose('failed', err instanceof Error ? err.message : String(err));
-    });
+    const channelLoop = this.runChannelLoop().catch(async (err) => {
+      if (this.isTerminated) return;
+      logError('[SSHSessionDO] Channel loop terminated with error:', err);
+      await this.handleSessionClose('failed', 'ssh_channel_failed');
+    }).catch((error) => logError('session_finalization_failed', error));
+    this.state?.waitUntil?.(channelLoop);
   }
 
   // --- SSH Receive Loop ---
@@ -844,6 +1050,7 @@ export class SSHSessionDO {
 
       if (msgType === SSH_MSG_CHANNEL_DATA) {
         const rawStdout = this.channel.handleChannelData(packet.payload);
+        if (await this.rejectFileTransfer(rawStdout, 'download')) break;
         this.resetIdleTimer();
 
         // Forward stdout to user terminal and read-only watchers
@@ -856,8 +1063,8 @@ export class SSHSessionDO {
           }
         }
 
-        const text = new TextDecoder('utf-8', { fatal: false }).decode(rawStdout);
-        this.recorder?.recordEvent('stdout', text);
+        const text = this.outputDecoder.decode(rawStdout, { stream: true });
+        await this.recorder?.recordEvent('stdout', text);
         this.heuristics?.feedStdout(text);
 
         // Check if local window buffer adjustment needed
@@ -867,6 +1074,7 @@ export class SSHSessionDO {
         }
       } else if (msgType === SSH_MSG_CHANNEL_EXTENDED_DATA) {
         const rawStderr = this.channel.handleExtendedData(packet.payload);
+        if (await this.rejectFileTransfer(rawStderr, 'download')) break;
         this.resetIdleTimer();
 
         this.userWebSocket?.send(rawStderr);
@@ -878,11 +1086,14 @@ export class SSHSessionDO {
           }
         }
 
-        const text = new TextDecoder('utf-8', { fatal: false }).decode(rawStderr);
-        this.recorder?.recordEvent('stdout', text);
+        const text = this.outputDecoder.decode(rawStderr, { stream: true });
+        await this.recorder?.recordEvent('stdout', text);
         this.heuristics?.feedStdout(text);
+        const adjust = this.channel.takeLocalWindowAdjustment(1024 * 1024);
+        if (adjust && this.channel.isOpen()) await this.sendPacket(this.channel.buildWindowAdjust(adjust));
       } else if (msgType === SSH_MSG_CHANNEL_WINDOW_ADJUST) {
         this.channel.handleWindowAdjust(packet.payload);
+        await this.flushTerminalInput();
       } else if (msgType === SSH_MSG_CHANNEL_EOF) {
         this.channel.handleEof(packet.payload);
       } else if (msgType === SSH_MSG_CHANNEL_CLOSE) {
@@ -892,6 +1103,28 @@ export class SSHSessionDO {
       } else if (msgType === SSH_MSG_DISCONNECT) {
         await this.handleSessionClose('closed', 'server_disconnect');
         break;
+      } else if (msgType === SSH_MSG_REQUEST_SUCCESS || msgType === SSH_MSG_REQUEST_FAILURE) {
+        this.keepaliveOutstanding = 0;
+      } else if (msgType === SSH_MSG_GLOBAL_REQUEST) {
+        const length = readUint32(packet.payload, 1);
+        if (packet.payload[5 + length]) await this.sendPacket(new Uint8Array([SSH_MSG_REQUEST_FAILURE]));
+      } else if (msgType === SSH_MSG_CHANNEL_REQUEST) {
+        const payload = packet.payload;
+        const length = readUint32(payload, 5);
+        if (payload.length < 10 + length) throw new Error('Malformed channel request');
+        const name = new TextDecoder().decode(payload.subarray(9, 9 + length));
+        const offset = 10 + length;
+        if (name === 'exit-status') this.exitCode = readUint32(payload, offset);
+        if (name === 'exit-signal') {
+          const signalLength = readUint32(payload, offset);
+          if (payload.length < offset + 4 + signalLength) throw new Error('Malformed exit signal');
+          this.exitSignal = new TextDecoder().decode(payload.subarray(offset + 4, offset + 4 + signalLength));
+        }
+        if (payload[9 + length]) {
+          const reply = new Uint8Array(5); reply[0] = 100; // CHANNEL_FAILURE for unsupported reply requests
+          writeUint32(reply, 1, this.channel.getRemoteChannelID());
+          await this.sendPacket(reply);
+        }
       }
       // IGNORE, DEBUG, and global requests are safely skipped
     }
@@ -900,95 +1133,39 @@ export class SSHSessionDO {
   // --- Host Key TOFU Handling ---
 
   private async processHostKeyTOFU(algorithm: string, fingerprint: string, hostKeyBlob: Uint8Array): Promise<void> {
-    if (!this.env?.DB || !this.config) return;
-
-    const assetId = this.config.assetId;
-    const b64PubKey = toBase64(hostKeyBlob);
-
-    const existing = await this.env.DB.prepare(
-      `SELECT id, fingerprint, status FROM ssh_host_keys WHERE asset_id = ? AND algorithm = ?`
-    )
-      .bind(assetId, algorithm)
-      .first<{ id: string; fingerprint: string; status: HostKeyStatus }>();
-
-    if (!existing || existing.status === 'unverified') {
-      // First connect TOFU: auto-record as verified
-      const recordId = existing?.id || crypto.randomUUID();
-      const now = Date.now();
-
-      await this.env.DB.prepare(
-        `INSERT INTO ssh_host_keys (id, asset_id, algorithm, fingerprint, public_key, verified_at, verified_by, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'system-tofu', 'verified', ?)
-         ON CONFLICT(asset_id, algorithm) DO UPDATE SET
-           fingerprint = excluded.fingerprint,
-           public_key = excluded.public_key,
-           verified_at = excluded.verified_at,
-           verified_by = 'system-tofu',
-           status = 'verified'`
-      )
-        .bind(recordId, assetId, algorithm, fingerprint, b64PubKey, now, now)
-        .run();
-
-      await this.env.DB.prepare(`UPDATE assets SET last_seen_host_key = ? WHERE id = ?`)
-        .bind(fingerprint, assetId)
-        .run();
-
-      await this.recordAuditEvent('HOST_KEY_TRUSTED', 'ssh_host_key', recordId, 'success', {
-        algorithm,
-        fingerprint,
-        assetId,
-      });
-
-      return;
-    }
-
-    if (existing.status === 'verified') {
-      if (existing.fingerprint === fingerprint) {
-        // Verified match
-        return;
-      }
-
-      // Host key changed! Potential MITM
-      await this.env.DB.prepare(`UPDATE ssh_host_keys SET status = 'changed' WHERE id = ?`)
-        .bind(existing.id)
-        .run();
-
-      await this.recordAuditEvent('HOST_KEY_CHANGED', 'ssh_host_key', existing.id, 'failure', {
-        expectedFingerprint: existing.fingerprint,
-        actualFingerprint: fingerprint,
-        algorithm,
-        assetId,
-        alert: 'Host key mismatch detected! Connection blocked.',
-      });
-
-      this.status = 'failed';
-      this.disconnectReason = 'host_key_changed';
-      await this.updateSessionStatusInD1('failed', 'host_key_changed');
-
-      throw new Error(
-        `Security Alert: Host key verification failed! Fingerprint changed. Expected: ${existing.fingerprint}, got: ${fingerprint}`
-      );
-    }
-
-    if (existing.status === 'changed') {
-      throw new Error(`Host key verification blocked: asset ${assetId} has pending changed host key status.`);
-    }
+    if (!this.env || !this.config) throw new Error('Session is not initialized');
+    try { await verifyAssetHostKey(this.env, this.config.assetId, algorithm, fingerprint, toBase64(hostKeyBlob), {
+      actorUserId: this.config.userId, actorUsername: this.config.usernameSnapshot,
+      sourceIp: this.config.sourceIp || '', userAgent: this.config.userAgent,
+    }); } catch (error) { await this.handleSessionClose('failed', 'host_key_changed'); throw error; }
   }
 
   // --- Session Termination & Cleanup ---
 
   async terminate(reason: string = 'terminated_by_admin', actorId?: string): Promise<void> {
-    this.terminatedBy = actorId || null;
+    if (!this.isTerminated) this.terminatedBy = actorId || null;
     await this.handleSessionClose('terminated', reason);
   }
 
   private async handleSessionClose(status: SessionStatus, reason: string): Promise<void> {
-    if (this.isTerminated) return;
-    this.isTerminated = true;
-    this.status = status;
-    this.disconnectReason = reason;
+    if (this.closeAudited) return;
+    if (!this.isTerminated) {
+      this.isTerminated = true;
+      this.status = status;
+      this.disconnectReason = reason;
+      this.endedAt = Date.now();
+    }
+    if (!this.closing) this.closing = this.finishSessionClose().finally(() => { this.closing = null; });
+    return this.closing;
+  }
+
+  private async finishSessionClose(): Promise<void> {
+    const status = this.status;
+    const reason = this.disconnectReason!;
 
     this.clearTimers();
+    if (this.config) { this.config.password = undefined; this.config.privateKey = undefined; }
+    this.validTickets.clear();
 
     // 1. Close channel
     if (this.channel && this.channel.isOpen() && !this.channel.hasSentClose()) {
@@ -999,6 +1176,13 @@ export class SSHSessionDO {
       }
     }
 
+    // Send a protocol disconnect before closing TCP.
+    if (this.socketWriter) {
+      try {
+        const code = new Uint8Array(4); writeUint32(code, 0, 11);
+        await this.sendPacket(concat(new Uint8Array([SSH_MSG_DISCONNECT]), code, encodeString('Session closed'), encodeString('')));
+      } catch {}
+    }
     // 2. Close TCP socket
     try {
       this.socket?.close();
@@ -1016,7 +1200,7 @@ export class SSHSessionDO {
         recordingHash = manifest.finalHash;
         recordingPath = manifest.recordingPath || null;
       } catch (err) {
-        console.error('[SSHSessionDO] Failed to close recording:', err);
+        logError('[SSHSessionDO] Failed to close recording:', err);
       }
     }
 
@@ -1035,16 +1219,21 @@ export class SSHSessionDO {
     this.watchers.clear();
 
     // 5. Update D1 ssh_sessions
+    try { await this.heuristics?.flush(); }
+    catch (error) { logError('command_audit_flush_failed', error); }
     await this.finalizeSessionInD1(status, reason, recordingPath, recordingHash);
 
     // 6. Audit Event
-    const action = status === 'terminated' ? 'SESSION_TERMINATED' : 'SESSION_CLOSED';
-    await this.recordAuditEvent(action, 'ssh_session', this.sessionId, 'success', {
+    const action = status === 'failed' ? 'SESSION_FAILED' : status === 'terminated' ? 'SESSION_TERMINATED' : 'SESSION_CLOSED';
+    await this.recordAuditEvent(action, 'ssh_session', this.sessionId, status === 'failed' ? 'failure' : 'success', {
       reason,
       status,
       terminatedBy: this.terminatedBy,
       recordingHash,
     });
+    this.closeAudited = true;
+    try { await this.state?.storage?.deleteAll(); }
+    catch (error) { logError('session_storage_cleanup_failed', error); }
   }
 
   // --- D1 Persistence Helpers ---
@@ -1052,28 +1241,12 @@ export class SSHSessionDO {
   private async persistSessionCreated(): Promise<void> {
     if (!this.env?.DB || !this.config) return;
 
-    const now = Date.now();
-    await this.env.DB.prepare(
-      `INSERT INTO ssh_sessions (
-         id, user_id, username_snapshot, asset_id, asset_name_snapshot,
-         account_id, account_name_snapshot, source_ip, user_agent,
-         started_at, status, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'connecting', ?)`
-    )
-      .bind(
-        this.sessionId,
-        this.config.userId,
-        this.config.usernameSnapshot || this.config.userId,
-        this.config.assetId,
-        this.config.assetNameSnapshot || this.config.host,
-        this.config.accountId,
-        this.config.accountNameSnapshot || this.config.username,
-        this.config.sourceIp || '127.0.0.1',
-        this.config.userAgent || 'EdgeJump Terminal',
-        now,
-        now
-      )
-      .run();
+    const row = await this.env.DB.prepare('SELECT user_id, asset_id, account_id FROM ssh_sessions WHERE id = ?')
+      .bind(this.sessionId).first<{ user_id: string; asset_id: string; account_id: string }>();
+    if (!row || row.user_id !== this.config.userId || row.asset_id !== this.config.assetId || row.account_id !== this.config.accountId) {
+      throw new Error('Session metadata does not match initialization');
+    }
+    await this.updateSessionStatusInD1('connecting');
   }
 
   private async updateSessionStatusInD1(status: SessionStatus, reason?: string): Promise<void> {
@@ -1094,9 +1267,9 @@ export class SSHSessionDO {
   ): Promise<void> {
     if (!this.env?.DB) return;
 
-    const endedAt = Date.now();
+    const endedAt = this.endedAt ?? Date.now();
     const storage = getRecordingStorage(this.env);
-    const recordingStatus = (storage && recordingPath) ? 'completed' : 'none';
+    const recordingStatus = storage ? (recordingPath ? 'completed' : 'failed') : 'none';
     await this.env.DB.prepare(
       `UPDATE ssh_sessions SET
          status = ?,
@@ -1107,6 +1280,7 @@ export class SSHSessionDO {
          recording_status = ?,
          recording_path = ?,
          recording_hash = ?
+         , exit_code = ?, exit_signal = ?
        WHERE id = ?`
     )
       .bind(
@@ -1118,6 +1292,8 @@ export class SSHSessionDO {
         recordingStatus,
         recordingPath,
         recordingHash,
+        this.exitCode,
+        this.exitSignal,
         this.sessionId
       )
       .run();
@@ -1132,32 +1308,13 @@ export class SSHSessionDO {
   ): Promise<void> {
     if (!this.env?.DB) return;
 
-    const id = crypto.randomUUID();
-    const now = Date.now();
-    const actorId = this.terminatedBy || this.config?.userId || null;
-    const actorUsername = this.config?.usernameSnapshot || 'system';
-
-    await this.env.DB.prepare(
-      `INSERT INTO audit_events (
-         id, timestamp, actor_user_id, actor_username_snapshot,
-         action, resource_type, resource_id, resource_name_snapshot,
-         source_ip, user_agent, result, metadata_json
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-      .bind(
-        id,
-        now,
-        actorId,
-        actorUsername,
-        action,
-        resourceType,
-        resourceId,
-        this.config?.assetNameSnapshot || resourceId,
-        this.config?.sourceIp || '127.0.0.1',
-        this.config?.userAgent || 'EdgeJump',
-        result,
-        metadata ? JSON.stringify(metadata) : null
-      )
-      .run();
+    await writeAuditEvent({
+      actorUserId: this.terminatedBy || this.config?.userId,
+      actorUsername: this.terminatedBy ? this.terminationActor.username : this.config?.usernameSnapshot,
+      action, resourceType, resourceId, resourceName: this.config?.assetNameSnapshot,
+      sourceIp: (this.terminatedBy ? this.terminationActor.sourceIp : this.config?.sourceIp) || '',
+      userAgent: (this.terminatedBy ? this.terminationActor.userAgent : this.config?.userAgent),
+      result, metadata,
+    }, this.env.DB);
   }
 }

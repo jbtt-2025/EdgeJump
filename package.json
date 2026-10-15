@@ -9,12 +9,14 @@
     "dev:web": "vite --config vite.config.ts",
     "build:web": "vite build --config vite.config.ts",
     "typecheck": "tsc -p tsconfig.worker.json --noEmit && tsc -p tsconfig.frontend.json --noEmit",
-    "test": "node --test --experimental-strip-types tests/*.test.ts",
+    "test": "node scripts/test.mjs",
+    "test:browser": "npm run build:web && playwright test",
     "build": "npm run build:web",
     "deploy:validate": "node --experimental-strip-types scripts/deploy.ts --validate-only",
     "deploy": "node --experimental-strip-types scripts/deploy.ts"
   },
   "dependencies": {
+    "@noble/hashes": "2.4.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-web-links": "^0.12.0",
     "@xterm/xterm": "^6.0.0",
@@ -22,20 +24,26 @@
     "lucide-react": "^1.16.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
-    "smol-toml": "^1.9.0",
-    "zmodem.js": "^0.1.10"
+    "smol-toml": "^1.9.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260727.1",
+    "@playwright/test": "1.64.1",
     "@tailwindcss/vite": "^4.3.3",
     "@types/node": "^22.20.4",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@types/ssh2": "1.15.6",
+    "@types/ws": "8.18.2",
     "@vitejs/plugin-react": "^5.0.0",
+    "esbuild": "0.28.2",
+    "miniflare": "5.20261012.0-beta",
+    "ssh2": "1.17.0",
     "tailwindcss": "^4.3.3",
     "typescript": "^5.9.2",
     "vite": "^7.0.6",
-    "wrangler": "^4.134.0"
+    "wrangler": "^4.134.0",
+    "ws": "8.22.0"
   },
   "engines": {
     "node": ">=22.12.0"

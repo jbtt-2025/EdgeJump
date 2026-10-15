@@ -1,3 +1,4 @@
+import { computeChunkHash, computeRollingHash, decompressGzip, type RecordingManifest, type TerminalEvent } from '../durable/recording.ts';
 import type { Env, SSHSessionRow, UserRow, AssetRow, AssetAccountRow } from '../types.ts';
 import type {
   SessionTicketResponse,
@@ -5,10 +6,21 @@ import type {
   HistoricalSessionSummary,
 } from '../shared/types.ts';
 import { checkUserAssetAccountAccess } from '../authorization/authorization-service.ts';
-import { getDecryptedCredential } from '../credentials/credential-service.ts';
 import { createTicket } from '../backend/security.ts';
 import { recordAuditEvent } from '../audit/audit-service.ts';
 import { getRecordingStorage } from '../storage/recording-storage.ts';
+import { getSetting } from '../settings/settings-service.ts';
+
+export async function enforcePermissionRevocation(
+  env: Env, actorId: string, context: { sourceIp?: string; userAgent?: string | null } = {}
+): Promise<void> {
+  if (await getSetting('terminate_sessions_on_permission_revocation', env.DB) !== 'true') return;
+  for (const session of await listOnlineSessions(env.DB)) {
+    if (!(await checkUserAssetAccountAccess(session.userId, session.assetId, session.accountId, 'connect', env.DB)).authorized) {
+      await terminateSession(session.id, actorId, env, 'Asset permission was revoked', context);
+    }
+  }
+}
 
 export interface CreateSessionOptions {
   userId: string;
@@ -20,7 +32,7 @@ export interface CreateSessionOptions {
 
 /**
  * Creates an SSH session for an authorized user, asset, and account.
- * Double-checks permissions, decrypts credential in memory, records audit snapshot,
+ * Double-checks permissions, records audit snapshot,
  * dispatches initialization to SSHSessionDO, and issues a short-lived session ticket.
  */
 export async function createSession(
@@ -106,90 +118,43 @@ export async function createSession(
     throw new Error(`Access denied: ${authResult.reason ?? 'Unauthorized'}`);
   }
 
-  // 5. Fetch credential and decrypt with Master KEK
-  const masterKek = env.CREDENTIAL_KEK_V1;
-  if (!masterKek) {
-    throw new Error('CREDENTIAL_KEK_V1 secret is required to decrypt credential');
+  // Host key changes are blocked before allocating a session or issuing a ticket.
+  const blockedKey = await env.DB.prepare("SELECT id FROM ssh_host_keys WHERE asset_id = ? AND status != 'verified'")
+    .bind(assetId).first();
+  if (blockedKey || asset.host_key_policy === 'approval_required') {
+    throw new Error('Host key requires administrator approval');
   }
+  if (!env.SESSION_TICKET_SECRET) throw new Error('Session ticket secret is not configured');
 
-  const decryptedCred = await getDecryptedCredential(account.credential_id, masterKek, env.DB);
-
-  // 6. Create ssh_sessions record with immutable snapshot fields
   const sessionId = `sess_${crypto.randomUUID()}`;
   const now = Date.now();
+  await env.DB.prepare(`INSERT INTO ssh_sessions (
+    id, user_id, username_snapshot, asset_id, asset_name_snapshot, account_id, account_name_snapshot,
+    source_ip, user_agent, started_at, status, recording_status, created_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'creating', 'none', ?)`)
+    .bind(sessionId, user.id, user.username, asset.id, asset.name, account.id, account.username,
+      clientIp, userAgent, now, now).run();
 
-  await env.DB.prepare(
-    `INSERT INTO ssh_sessions (
-      id, user_id, username_snapshot,
-      asset_id, asset_name_snapshot,
-      account_id, account_name_snapshot,
-      source_ip, user_agent,
-      started_at, ended_at, status,
-      disconnect_reason, client_closed, terminated_by,
-      recording_status, recording_path, recording_hash, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'creating', NULL, 0, NULL, 'none', NULL, NULL, ?)`
-  )
-    .bind(
-      sessionId,
-      user.id,
-      user.username,
-      asset.id,
-      asset.name,
-      account.id,
-      account.username,
-      clientIp,
-      userAgent,
-      now,
-      now
-    )
-    .run();
-
-  // 7. Issue session ticket & dispatch to SSHSessionDO
-  const ticketSecret = env.AUTH_PEPPER || env.CREDENTIAL_KEK_V1 || 'default-ticket-secret';
-  const ticketSecretBytes = new TextEncoder().encode(ticketSecret);
-
-  const { ticket, expiresAt } = await createTicket(ticketSecretBytes, clientIp, {
-    sessionId,
-    userId: user.id,
-    assetId: asset.id,
-    accountId: account.id,
+  const { ticket, expiresAt } = await createTicket(new TextEncoder().encode(env.SESSION_TICKET_SECRET), clientIp, {
+    sessionId, userId: user.id, assetId: asset.id, accountId: account.id,
   });
-
-  if (env.SSH_SESSIONS) {
-    try {
-      const doId = env.SSH_SESSIONS.idFromName(sessionId);
-      const stub = env.SSH_SESSIONS.get(doId);
-      await stub.fetch(
-        new Request('http://internal/init', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            sessionId,
-            userId: user.id,
-            username: user.username,
-            asset: {
-              id: asset.id,
-              name: asset.name,
-              hostname: asset.hostname,
-              port: asset.port,
-              hostKeyPolicy: asset.host_key_policy,
-            },
-            account: {
-              id: account.id,
-              username: account.username,
-            },
-            credential: {
-              type: decryptedCred.type,
-              plaintext: decryptedCred.plaintext,
-            },
-            ticket,
-            clientIp,
-          }),
-        })
-      );
-    } catch (err) {
-      console.warn('DO dispatch error:', err);
-    }
+  try {
+    const stub = env.SSH_SESSIONS.get(env.SSH_SESSIONS.idFromName(sessionId));
+    const response = await stub.fetch(new Request('https://session.internal/init', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId, userId: user.id, usernameSnapshot: user.username,
+        assetId: asset.id, assetNameSnapshot: asset.name, accountId: account.id,
+        accountNameSnapshot: account.username, host: asset.hostname, port: asset.port,
+        username: account.username, sourceIp: clientIp, userAgent, ticket, expiresAt, createdAt: now }),
+    }));
+    if (!response.ok) throw new Error('Session initialization failed');
+  } catch {
+    await env.DB.prepare("UPDATE ssh_sessions SET status = 'failed', ended_at = ?, disconnect_reason = 'initialization_failed' WHERE id = ?")
+      .bind(Date.now(), sessionId).run();
+    await recordAuditEvent({ actorUserId: user.id, actorUsername: user.username, action: 'SESSION_FAILED',
+      resourceType: 'session', resourceId: sessionId, sourceIp: clientIp, userAgent,
+      result: 'failure', metadata: { reason: 'initialization_failed' } }, env.DB);
+    throw new Error('Session initialization failed');
   }
 
   // 8. Record audit event
@@ -251,6 +216,8 @@ export async function getSession(
     disconnectReason: row.disconnect_reason,
     recordingPath: row.recording_path,
     recordingHash: row.recording_hash,
+    exitCode: row.exit_code,
+    exitSignal: row.exit_signal,
   };
 }
 
@@ -286,7 +253,7 @@ export async function listOnlineSessions(db: D1Database): Promise<OnlineSessionS
  */
 export async function listHistoricalSessions(
   db: D1Database,
-  options: { limit?: number; offset?: number; userId?: string } = {}
+  options: { limit?: number; offset?: number; userId?: string; includeActive?: boolean } = {}
 ): Promise<HistoricalSessionSummary[]> {
   const limit = Math.min(options.limit ?? 50, 200);
   const offset = options.offset ?? 0;
@@ -294,6 +261,7 @@ export async function listHistoricalSessions(
   let query = 'SELECT * FROM ssh_sessions';
   const conditions: string[] = [];
   const params: unknown[] = [];
+  if (!options.includeActive) conditions.push("status IN ('closed', 'failed', 'terminated', 'timeout')");
 
   if (options.userId) {
     conditions.push('user_id = ?');
@@ -325,6 +293,8 @@ export async function listHistoricalSessions(
     disconnectReason: row.disconnect_reason,
     recordingPath: row.recording_path,
     recordingHash: row.recording_hash,
+    exitCode: row.exit_code,
+    exitSignal: row.exit_signal,
   }));
 }
 
@@ -335,58 +305,19 @@ export async function terminateSession(
   sessionId: string,
   terminatedBy: string,
   env: Env,
-  reason: string = 'Terminated by administrator'
+  reason: string = 'Terminated by administrator',
+  context: { sourceIp?: string; userAgent?: string | null; clientClosed?: boolean } = {}
 ): Promise<void> {
-  const now = Date.now();
-
-  const session = await env.DB.prepare('SELECT * FROM ssh_sessions WHERE id = ?')
-    .bind(sessionId)
-    .first<SSHSessionRow>();
-
-  if (!session) {
-    throw new Error('Session not found');
-  }
-
-  await env.DB.prepare(
-    `UPDATE ssh_sessions SET
-      status = 'terminated',
-      ended_at = ?,
-      disconnect_reason = ?,
-      terminated_by = ?
-    WHERE id = ?`
-  )
-    .bind(now, reason, terminatedBy, sessionId)
-    .run();
-
-  if (env.SSH_SESSIONS) {
-    try {
-      const doId = env.SSH_SESSIONS.idFromName(sessionId);
-      const stub = env.SSH_SESSIONS.get(doId);
-      await stub.fetch(
-        new Request('http://internal/terminate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId, terminatedBy, reason }),
-        })
-      );
-    } catch (err) {
-      console.warn('DO terminate dispatch error:', err);
-    }
-  }
-
-  await recordAuditEvent(
-    {
-      actorUserId: terminatedBy,
-      action: 'SESSION_TERMINATED',
-      resourceType: 'session',
-      resourceId: sessionId,
-      resourceName: `${session.asset_name_snapshot} (${session.account_name_snapshot})`,
-      sourceIp: '127.0.0.1',
-      result: 'success',
-      metadata: { reason },
-    },
-    env.DB
-  );
+  const session = await getSessionDetail(sessionId, env.DB);
+  if (!session) throw new Error('Session not found');
+  if (!['creating', 'connecting', 'active'].includes(session.status)) return;
+  const actor = await env.DB.prepare('SELECT username FROM users WHERE id = ?').bind(terminatedBy).first<{ username: string }>();
+  const stub = env.SSH_SESSIONS.get(env.SSH_SESSIONS.idFromName(sessionId));
+  const response = await stub.fetch(new Request('https://session.internal/terminate', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ actorId: terminatedBy, actorUsername: actor?.username, reason, ...context }),
+  }));
+  if (!response.ok) throw new Error('Session termination failed');
 }
 
 /**
@@ -423,33 +354,54 @@ export async function getSessionCommands(
 /**
  * Retrieves the session recording manifest and chunks from R2.
  */
-export async function getSessionRecording(
-  sessionId: string,
-  env: Env
-): Promise<{ manifest: any; chunks: string[] } | null> {
+export async function getSessionRecording(sessionId: string, env: Env): Promise<RecordingManifest | null> {
   const session = await getSessionDetail(sessionId, env.DB);
-  if (!session) return null;
-
   const storage = getRecordingStorage(env);
-  if (!storage || !session.recording_path || session.recording_status === 'none') {
-    return null;
+  if (!session || !storage || !session.recording_path || session.recording_status !== 'completed') return null;
+  const cleanup = await env.DB.prepare(`SELECT session_id FROM recording_cleanup_jobs WHERE session_id = ?
+    AND chunk_count IS NOT NULL AND (next_chunk > 1 OR lease_id IS NOT NULL)`)
+    .bind(sessionId).first();
+  if (cleanup) return null;
+  const object = await storage.get(`${session.recording_path}/manifest.json`);
+  if (!object) throw new Error('Recording manifest is missing');
+  const manifest = await object.json<RecordingManifest>();
+  if (manifest.sessionId !== sessionId || !Number.isSafeInteger(manifest.chunkCount) || manifest.chunkCount < 1 || manifest.chunkCount > 100000) {
+    throw new Error('Recording manifest is invalid');
   }
-
-  const prefix = session.recording_path;
-
-  const manifestObj = await storage.get(`${prefix}/manifest.json`);
-  let manifest = null;
-  if (manifestObj) {
-    try {
-      manifest = await manifestObj.json();
-    } catch {
-      // fallback
+  // Older manifests contain only a final hash; reconstruct their descriptors.
+  if (!manifest.chunks) {
+    manifest.chunks = [];
+    let rolling: string | null = null;
+    for (let index = 1; index <= manifest.chunkCount; index++) {
+      const path = `${session.recording_path}/chunk-${String(index).padStart(6, '0')}.jsonl.gz`;
+      const chunk = await storage.get(path);
+      if (!chunk) throw new Error('Recording chunk is missing');
+      const hash = await computeChunkHash(new Uint8Array(await chunk.arrayBuffer()));
+      rolling = await computeRollingHash(rolling, hash);
+      manifest.chunks.push({ index, path, hash, rollingHash: rolling });
     }
   }
-
-  return {
-    manifest: manifest ?? { sessionId, finalHash: session.recording_hash },
-    chunks: [],
-  };
+  if (manifest.chunks.length !== manifest.chunkCount) throw new Error('Recording chunk count mismatch');
+  let rolling: string | null = null;
+  for (const [index, chunk] of manifest.chunks.entries()) {
+    if (chunk.index !== index + 1 || !/^[a-f0-9]{64}$/.test(chunk.hash)) throw new Error('Recording chunk descriptor is invalid');
+    rolling = await computeRollingHash(rolling, chunk.hash);
+    if (chunk.rollingHash !== rolling) throw new Error('Recording hash chain mismatch');
+    // Never trust object paths from a mutable manifest.
+    chunk.path = `${session.recording_path}/chunk-${String(index + 1).padStart(6, '0')}.jsonl.gz`;
+  }
+  if (rolling !== manifest.finalHash || rolling !== session.recording_hash) throw new Error('Recording integrity check failed');
+  return manifest;
 }
 
+export async function getSessionRecordingChunk(sessionId: string, index: number, env: Env) {
+  const manifest = await getSessionRecording(sessionId, env);
+  if (!manifest || !Number.isSafeInteger(index) || index < 1 || index > manifest.chunkCount) return null;
+  const descriptor = manifest.chunks![index - 1];
+  const object = await getRecordingStorage(env)!.get(descriptor.path);
+  if (!object) throw new Error('Recording chunk is missing');
+  const bytes = new Uint8Array(await object.arrayBuffer());
+  if (await computeChunkHash(bytes) !== descriptor.hash) throw new Error('Recording chunk integrity check failed');
+  const text = new TextDecoder().decode(await decompressGzip(bytes));
+  return text.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as TerminalEvent);
+}
