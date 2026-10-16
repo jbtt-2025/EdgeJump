@@ -11,6 +11,7 @@ interface DashboardProps {
 
 export const Dashboard: React.FC<DashboardProps> = ({ onOpenTerminal }) => {
   const { user, hasPermission } = useAuth();
+  const administrator = user?.roles.some((role) => ['role_super_admin', 'role_asset_admin'].includes(role));
   const [assets, setAssets] = useState<AuthorizedAsset[]>([]);
   const [sessions, setSessions] = useState<HistoricalSessionSummary[]>([]);
   const [group, setGroup] = useState<string | null>(null);
@@ -106,7 +107,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTerminal }) => {
             <Shield className="w-12 h-12 text-slate-500 mx-auto mb-3" />
             <h3 className="text-base font-medium text-slate-300">暂无可访问资产</h3>
             <p className="text-slate-500 text-sm mt-1 max-w-sm mx-auto">
-              您目前尚未被授予任何资产的 SSH 登录权限。请联系管理员在堡垒机后台配置授权规则。
+              {administrator ? '请在堡垒机管理中添加机器与 SSH 账号，保存后即可连接。' : '您目前尚未被授予任何资产的 SSH 登录权限。请联系管理员在堡垒机后台配置授权规则。'}
             </p>
           </div>
         ) : (
@@ -140,6 +141,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTerminal }) => {
                   <div className="mt-4 pt-3 border-t border-slate-700/60">
                     <span className="text-xs text-slate-400 font-medium">可用 SSH 账号：</span>
                     <div className="flex flex-wrap gap-1.5 mt-1.5">
+                      {!asset.accounts.length && <span className="text-sm text-slate-400">尚未配置 SSH 账号</span>}
                       {asset.accounts?.map((acc: any) => (
                         <span
                           key={acc.id}
@@ -153,11 +155,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ onOpenTerminal }) => {
                 </div>
 
                 <button
+                  disabled={!asset.accounts.length}
                   onClick={() => {
                     setSelectedAsset(asset);
                     setSelectedAccount(asset.accounts?.[0] || null);
                   }}
-                  className="mt-5 w-full flex items-center justify-center space-x-2 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition"
+                  className="mt-5 w-full flex items-center justify-center space-x-2 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-medium transition disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <Terminal className="w-4 h-4" />
                   <span>打开 Web Terminal</span>

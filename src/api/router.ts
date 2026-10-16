@@ -29,6 +29,7 @@ import {
   updateAssetGroup,
   deleteAssetGroup,
   listAssetAccounts,
+  listAllAssetAccounts,
   createAssetAccount,
   updateAssetAccount,
   deleteAssetAccount,
@@ -77,6 +78,8 @@ import {
 import { getAllSettings, updateSetting } from '../settings/settings-service.ts';
 import { recordAuditEvent, listAuditEvents } from '../audit/audit-service.ts';
 import { hasPermission, Permissions } from '../rbac/permissions.ts';
+import { getDemoProtectedUserIds, changesProtectedGroupMembers } from '../rbac/administrators.ts';
+import { provisionAsset, provisionAccount, ProvisioningInputError } from '../assets/provisioning-service.ts';
 import { getRecordingStorage } from '../storage/recording-storage.ts';
 import { cleanupExpiredRecordings } from '../sessions/cleanup-service.ts';
 import { verifyTicket, parseTicketPayload } from '../backend/security.ts';
@@ -91,28 +94,7 @@ export function isDemoMode(env: Env): boolean {
 }
 
 async function isUserAdministrator(userId: string, db: D1Database): Promise<boolean> {
-  const user = await db
-    .prepare('SELECT username FROM users WHERE id = ?')
-    .bind(userId)
-    .first<{ username: string }>();
-  if (user?.username === 'admin') return true;
-
-  const roles = await db
-    .prepare(
-      `SELECT r.name
-       FROM roles r
-       JOIN user_roles ur ON r.id = ur.role_id
-       WHERE ur.user_id = ?`
-    )
-    .bind(userId)
-    .all<{ name: string }>();
-
-  return (roles.results || []).some(
-    (r) =>
-      r.name.toLowerCase().includes('admin') ||
-      r.name === 'Super Admin' ||
-      r.name === 'Asset Admin'
-  );
+  return (await getDemoProtectedUserIds(db)).has(userId);
 }
 
 function extractSessionToken(request: Request): string | null {
@@ -477,7 +459,8 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       return jsonError('Permission denied', 403);
     }
     const users = await listUsers(env.DB);
-    return jsonResponse(users);
+    const protectedIds = isDemoMode(env) ? await getDemoProtectedUserIds(env.DB) : new Set<string>();
+    return jsonResponse(users.map((user) => ({ ...user, demoProtected: protectedIds.has(user.id) })));
   }
 
   if (path === '/api/admin/users' && method === 'POST') {
@@ -497,6 +480,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     if (!subAction && method === 'PATCH') {
       if (!hasPermission(currentUser.permissions, Permissions.USER_UPDATE)) {
         return jsonError('Permission denied', 403);
+      }
+      if (isDemoMode(env) && await isUserAdministrator(targetUserId, env.DB)) {
+        return jsonError('演示模式下管理员账号受保护，不能修改资料、角色或用户组。', 403);
       }
       const body = await request.json<any>();
       await updateUser(targetUserId, body, currentUser.id, env.DB, clientIp, userAgent);
@@ -519,6 +505,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       if (!hasPermission(currentUser.permissions, Permissions.USER_DISABLE) && !hasPermission(currentUser.permissions, Permissions.USER_UPDATE)) {
         return jsonError('Permission denied', 403);
       }
+      if (isDemoMode(env) && await isUserAdministrator(targetUserId, env.DB)) return jsonError('演示模式下管理员账号的启停状态受保护。', 403);
       await enableUser(targetUserId, currentUser.id, env.DB, clientIp, userAgent);
       return jsonResponse({ success: true });
     }
@@ -562,6 +549,10 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
         return jsonError('Permission denied', 403);
       }
       const body = await request.json<any>();
+      if (isDemoMode(env) && body.members !== undefined) {
+        if (!Array.isArray(body.members)) return jsonError('用户组成员格式不正确。', 400);
+        if (await changesProtectedGroupMembers(groupId, body.members, env.DB)) return jsonError('演示模式下不能修改受保护管理员的用户组成员关系。', 403);
+      }
       await updateGroup(groupId, body, currentUser.id, env.DB, clientIp, userAgent);
       await enforcePermissionRevocation(env, currentUser.id, context);
       return jsonResponse({ success: true });
@@ -570,6 +561,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       if (!hasPermission(currentUser.permissions, Permissions.GROUP_WRITE)) {
         return jsonError('Permission denied', 403);
       }
+      if (isDemoMode(env) && await changesProtectedGroupMembers(groupId, [], env.DB)) return jsonError('该用户组包含受保护的演示管理员，不能删除。', 403);
       await deleteGroup(groupId, currentUser.id, env.DB, clientIp, userAgent);
       await enforcePermissionRevocation(env, currentUser.id, context);
       return jsonResponse({ success: true });
@@ -588,6 +580,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
   const rolePermissionMatch = path.match(/^\/api\/admin\/roles\/([^/]+)$/);
   if (rolePermissionMatch && method === 'PATCH') {
     if (!hasPermission(currentUser.permissions, Permissions.SETTINGS_WRITE)) return jsonError('Permission denied', 403);
+    if (isDemoMode(env)) return jsonError('演示模式下系统角色权限为只读。', 403);
     if (rolePermissionMatch[1] !== 'role_security_auditor') return jsonError('Only the auditor termination setting is configurable', 400);
     const body = await request.json<any>();
     if (typeof body.canTerminate !== 'boolean') return jsonError('canTerminate must be boolean', 400);
@@ -613,6 +606,16 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
       return jsonError('Permission denied', 403);
     }
     const body = await request.json<any>();
+    if (body.accounts !== undefined) {
+      if (!Array.isArray(body.accounts)) return jsonError('SSH 账号列表格式不正确。', 400);
+      if (body.accounts.length && !hasPermission(currentUser.permissions, Permissions.CREDENTIAL_CREATE)) return jsonError('Permission denied', 403);
+      try {
+        return jsonResponse(await provisionAsset(body, { id: currentUser.id, username: currentUser.username, sourceIp: clientIp, userAgent }, env), 201);
+      } catch (error) {
+        if (error instanceof ProvisioningInputError) return jsonError(error.message, 400);
+        throw error;
+      }
+    }
     const asset = await createAsset(body, currentUser.id, env.DB);
     await audit('ASSET_CREATED', 'asset', asset.id, asset.name);
     return jsonResponse(asset, 201);
@@ -644,6 +647,10 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
   }
 
   // Admin Asset Accounts CRUD
+  if (path === '/api/admin/accounts' && method === 'GET') {
+    if (!hasPermission(currentUser.permissions, Permissions.ASSET_READ)) return jsonError('Permission denied', 403);
+    return jsonResponse(await listAllAssetAccounts(env.DB));
+  }
   const adminAccountMatch = path.match(/^\/api\/admin\/assets\/([^\/]+)\/accounts$/);
   if (adminAccountMatch) {
     const assetId = adminAccountMatch[1];
@@ -657,6 +664,14 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
         return jsonError('Permission denied', 403);
       }
       const body = await request.json<any>();
+      if (body.credential !== undefined) {
+        try {
+          return jsonResponse(await provisionAccount(assetId, body, { id: currentUser.id, username: currentUser.username, sourceIp: clientIp, userAgent }, env), 201);
+        } catch (error) {
+          if (error instanceof ProvisioningInputError) return jsonError(error.message, 400);
+          throw error;
+        }
+      }
       const account = await createAssetAccount({ ...body, assetId }, env.DB);
       await audit('ACCOUNT_CREATED', 'account', account.id, account.username, { assetId });
       return jsonResponse(account, 201);

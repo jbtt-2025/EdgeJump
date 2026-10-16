@@ -7,6 +7,7 @@ import type {
 } from '../types.ts';
 import type { AuthorizationRuleSummary } from '../shared/types.ts';
 import { getAssetGroupAncestors, getAssetGroupDescendants } from '../assets/asset-service.ts';
+import { isAssetAdministrator } from '../rbac/administrators.ts';
 
 export interface CreateAuthorizationRuleInput {
   name: string;
@@ -385,6 +386,10 @@ export async function checkUserAssetAccountAccess(
     return { authorized: false, reason: 'Account is disabled' };
   }
 
+  if (action === 'connect' && await isAssetAdministrator(userId, db)) {
+    return { authorized: true };
+  }
+
   // 4. Resolve user's user group memberships
   const { results: userGroupRows } = await db
     .prepare('SELECT group_id FROM group_members WHERE user_id = ?')
@@ -519,6 +524,22 @@ export async function getAuthorizedAssetsForUser(
 
   if (!user || user.status !== 'active') {
     return [];
+  }
+
+  if (await isAssetAdministrator(userId, db)) {
+    const assets = await db.prepare('SELECT * FROM assets WHERE enabled = 1').all<AssetRow>();
+    const accounts = await db.prepare(`SELECT a.id, a.asset_id, a.username, c.type AS credential_type, c.name AS credential_name
+      FROM asset_accounts a JOIN credentials c ON c.id = a.credential_id WHERE a.enabled = 1`).all<{
+        id: string; asset_id: string; username: string; credential_type: CredentialType; credential_name: string;
+      }>();
+    const visible: AuthorizedAsset[] = assets.results.map((asset) => ({
+      id: asset.id, name: asset.name, hostname: asset.hostname, port: asset.port, description: asset.description,
+      platform: asset.platform, environment: asset.environment, groupIds: [],
+      accounts: accounts.results.filter((account) => account.asset_id === asset.id).map((account) => ({
+        id: account.id, username: account.username, credentialType: account.credential_type, credentialName: account.credential_name,
+      })),
+    }));
+    return enrichAssetGroups(visible, db);
   }
 
   // 2. Fetch user's user group memberships
@@ -697,6 +718,10 @@ export async function getAuthorizedAssetsForUser(
     }
   }
 
+  return enrichAssetGroups(result, db);
+}
+
+async function enrichAssetGroups(result: AuthorizedAsset[], db: D1Database): Promise<AuthorizedAsset[]> {
   for (const asset of result) {
     const memberships = await db.prepare('SELECT group_id FROM asset_group_members WHERE asset_id = ?').bind(asset.id).all<{ group_id: string }>();
     asset.groupIds = (memberships.results || []).map((row) => row.group_id);

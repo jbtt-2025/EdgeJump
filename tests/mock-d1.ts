@@ -59,11 +59,16 @@ export class MockD1Database {
   }
 
   async batch(statements: MockD1PreparedStatement[]): Promise<any[]> {
-    const results = [];
-    for (const stmt of statements) {
-      results.push(await stmt.run());
+    this.sqlite.exec('BEGIN');
+    try {
+      const results = [];
+      for (const stmt of statements) results.push(await stmt.run());
+      this.sqlite.exec('COMMIT');
+      return results;
+    } catch (error) {
+      this.sqlite.exec('ROLLBACK');
+      throw error;
     }
-    return results;
   }
 
   async exec(query: string): Promise<{ count: number; duration: number }> {

@@ -18,6 +18,14 @@ export async function createCredential(
   masterKek: string,
   db: D1Database
 ): Promise<CredentialSummary> {
+  const prepared = await prepareCredentialCreation(input, masterKek, db);
+  await prepared.statement.run();
+  return prepared.credential;
+}
+
+export async function prepareCredentialCreation(
+  input: CreateCredentialInput, masterKek: string, db: D1Database
+): Promise<{ credential: CredentialSummary; statement: D1PreparedStatement }> {
   const name = input.name.trim();
   if (!name) {
     throw new Error('Credential name is required');
@@ -47,7 +55,7 @@ export async function createCredential(
     keyVersion
   );
 
-  await db
+  const statement = db
     .prepare(
       `INSERT INTO credentials (
         id, name, type,
@@ -70,17 +78,16 @@ export async function createCredential(
       'AES-256-GCM',
       now,
       now
-    )
-    .run();
+    );
 
-  return {
+  return { statement, credential: {
     id,
     name,
     type: input.type,
     keyVersion,
     createdAt: now,
     updatedAt: now,
-  };
+  } };
 }
 
 /**

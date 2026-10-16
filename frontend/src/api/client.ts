@@ -88,12 +88,13 @@ export const api = {
 
   // Admin Assets
   listAdminAssets: () => request<AssetSummary[]>('/api/admin/assets'),
-  createAsset: (data: any) => request('/api/admin/assets', { method: 'POST', body: JSON.stringify(data) }),
+  createAsset: (data: any) => request<AssetSummary>('/api/admin/assets', { method: 'POST', body: JSON.stringify(data) }),
   updateAsset: (id: string, data: any) => request(`/api/admin/assets/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAsset: (id: string) => request(`/api/admin/assets/${id}`, { method: 'DELETE' }),
 
   listAssetAccounts: (assetId: string) => request<AssetAccountSummary[]>(`/api/admin/assets/${assetId}/accounts`),
-  createAssetAccount: (assetId: string, data: any) => request(`/api/admin/assets/${assetId}/accounts`, { method: 'POST', body: JSON.stringify(data) }),
+  listAllAssetAccounts: () => request<AssetAccountSummary[]>('/api/admin/accounts'),
+  createAssetAccount: (assetId: string, data: any) => request<AssetAccountSummary>(`/api/admin/assets/${assetId}/accounts`, { method: 'POST', body: JSON.stringify(data) }),
   updateAssetAccount: (assetId: string, id: string, data: unknown) => request(`/api/admin/assets/${assetId}/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAssetAccount: (assetId: string, id: string) => request(`/api/admin/assets/${assetId}/accounts/${id}`, { method: 'DELETE' }),
 
@@ -104,7 +105,7 @@ export const api = {
 
   // Admin Credentials
   listCredentials: () => request<CredentialSummary[]>('/api/admin/credentials'),
-  createCredential: (data: any) => request('/api/admin/credentials', { method: 'POST', body: JSON.stringify(data) }),
+  createCredential: (data: any) => request<CredentialSummary>('/api/admin/credentials', { method: 'POST', body: JSON.stringify(data) }),
   replaceCredential: (id: string, secret: string) => request(`/api/admin/credentials/${id}`, { method: 'PUT', body: JSON.stringify({ secret }) }),
   deleteCredential: (id: string) => request(`/api/admin/credentials/${id}`, { method: 'DELETE' }),
   rewrapCredential: (id: string, version: string) => request(`/api/admin/credentials/${id}/rewrap`, { method: 'POST', body: JSON.stringify({ version }) }),

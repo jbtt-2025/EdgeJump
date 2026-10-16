@@ -16,6 +16,10 @@ test('shared demo administrator enters without MFA and can manage short user pas
   await page.getByRole('button', { name: '用户', exact: true }).click();
   const administrator = page.getByRole('row').filter({ has: page.getByText('d', { exact: true }) });
   await expect(administrator).toContainText('演示模式停用');
+  await expect(administrator).toContainText('演示保护 · 只读');
+  await expect(administrator.getByRole('button', { name: '编辑', exact: true })).toHaveCount(0);
+  await expect(administrator.getByRole('button', { name: '重置密码', exact: true })).toHaveCount(0);
+  await expect(administrator.getByRole('button', { name: '禁用', exact: true })).toHaveCount(0);
   await page.getByRole('button', { name: '新建用户', exact: true }).click();
   await page.getByLabel('用户名', { exact: true }).fill('s');
   await page.getByLabel('密码', { exact: true }).fill('1');

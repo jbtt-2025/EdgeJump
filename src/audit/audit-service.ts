@@ -60,6 +60,14 @@ export async function recordAuditEvent(
   event: CreateAuditEventInput,
   db: D1Database
 ): Promise<string> {
+  const prepared = await prepareAuditEvent(event, db);
+  await prepared.statement.run();
+  return prepared.id;
+}
+
+export async function prepareAuditEvent(
+  event: CreateAuditEventInput, db: D1Database
+): Promise<{ id: string; statement: D1PreparedStatement }> {
   const id = `audit_${crypto.randomUUID()}`;
   const timestamp = Date.now();
 
@@ -71,7 +79,7 @@ export async function recordAuditEvent(
     metadataJson = JSON.stringify(cleanMeta);
   }
 
-  await db
+  const statement = db
     .prepare(
       `INSERT INTO audit_events (
         id, timestamp, actor_user_id, actor_username_snapshot,
@@ -92,10 +100,9 @@ export async function recordAuditEvent(
       event.userAgent ?? null,
       event.result,
       metadataJson
-    )
-    .run();
+    );
 
-  return id;
+  return { id, statement };
 }
 
 export async function listAuditEvents(

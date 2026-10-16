@@ -55,6 +55,15 @@ export interface CredentialSummary {
   updatedAt: number;
 }
 
+export interface NewAccountCredential { name?: string; type: 'password' | 'private_key'; secret: string }
+export interface AccountConnectionInput {
+  username: string;
+  credentialId?: string;
+  credential?: NewAccountCredential;
+  enabled?: boolean;
+}
+export type AssetAccountConnectionInput = AccountConnectionInput | { sourceAccountId: string };
+
 export interface AuthorizationRuleSummary {
   id: string;
   name: string;
@@ -170,7 +179,7 @@ export interface RecordingManifest {
   chunks?: { index: number; path: string; hash: string; rollingHash: string }[];
 }
 
-export interface AdminUserSummary extends UserSummary { groups: string[]; updatedAt: number }
+export interface AdminUserSummary extends UserSummary { groups: string[]; updatedAt: number; demoProtected?: boolean }
 export interface UserGroupSummary { id: string; name: string; description: string | null; memberCount: number; memberIds: string[] }
 export interface RoleSummary { id: string; name: string; description: string | null; permissions: string[] }
 export interface HostKeySummary {

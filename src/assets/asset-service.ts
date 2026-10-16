@@ -59,6 +59,14 @@ export async function createAsset(
   createdBy: string | null,
   db: D1Database
 ): Promise<AssetSummary> {
+  const prepared = await prepareAssetCreation(input, createdBy, db);
+  for (const statement of prepared.statements) await statement.run();
+  return prepared.asset;
+}
+
+export async function prepareAssetCreation(
+  input: CreateAssetInput, createdBy: string | null, db: D1Database
+): Promise<{ asset: AssetSummary; statements: D1PreparedStatement[] }> {
   const name = input.name.trim();
   if (!name) throw new Error('Asset name is required');
 
@@ -78,7 +86,7 @@ export async function createAsset(
   const environment = input.environment ?? 'production';
   const enabledInt = input.enabled ?? true ? 1 : 0;
 
-  await db
+  const statements = [db
     .prepare(
       `INSERT INTO assets (
         id, name, hostname, port, description,
@@ -98,18 +106,16 @@ export async function createAsset(
       now,
       now,
       createdBy
-    )
-    .run();
+    )];
 
   const groupIds = input.groupIds ?? [];
   for (const gid of groupIds) {
-    await db
+    statements.push(db
       .prepare('INSERT OR IGNORE INTO asset_group_members (group_id, asset_id) VALUES (?, ?)')
-      .bind(gid, id)
-      .run();
+      .bind(gid, id));
   }
 
-  return {
+  return { statements, asset: {
     id,
     name,
     hostname,
@@ -119,7 +125,7 @@ export async function createAsset(
     environment,
     enabled: enabledInt === 1,
     groupIds,
-  };
+  } };
 }
 
 export async function getAsset(id: string, db: D1Database): Promise<AssetSummary | null> {
@@ -505,20 +511,32 @@ export async function createAssetAccount(
 
   if (!credential) throw new Error(`Credential not found: ${input.credentialId}`);
 
+  const prepared = prepareAccountCreation(input, credential, db);
+  await prepared.statement.run();
+  return prepared.account;
+}
+
+export function prepareAccountCreation(
+  input: CreateAssetAccountInput,
+  credential: { name: string; type: CredentialType },
+  db: D1Database
+): { account: AssetAccountSummary; statement: D1PreparedStatement } {
+  const username = input.username.trim();
+  if (!username) throw new Error('Account username is required');
+
   const id = `acc_${crypto.randomUUID()}`;
   const now = Date.now();
   const enabledInt = input.enabled ?? true ? 1 : 0;
 
-  await db
+  const statement = db
     .prepare(
       `INSERT INTO asset_accounts (
         id, asset_id, username, credential_id, enabled, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?)`
     )
-    .bind(id, input.assetId, username, input.credentialId, enabledInt, now, now)
-    .run();
+    .bind(id, input.assetId, username, input.credentialId, enabledInt, now, now);
 
-  return {
+  return { statement, account: {
     id,
     assetId: input.assetId,
     username,
@@ -526,7 +544,7 @@ export async function createAssetAccount(
     credentialType: credential.type,
     credentialName: credential.name,
     enabled: enabledInt === 1,
-  };
+  } };
 }
 
 export async function getAssetAccount(
@@ -611,15 +629,23 @@ export async function listAssetAccounts(
   assetId: string,
   db: D1Database
 ): Promise<AssetAccountSummary[]> {
+  return listAccounts(assetId, db);
+}
+
+export async function listAllAssetAccounts(db: D1Database): Promise<AssetAccountSummary[]> {
+  return listAccounts(null, db);
+}
+
+async function listAccounts(assetId: string | null, db: D1Database): Promise<AssetAccountSummary[]> {
   const { results } = await db
     .prepare(
       `SELECT a.*, c.name as credential_name, c.type as credential_type
        FROM asset_accounts a
        JOIN credentials c ON a.credential_id = c.id
-       WHERE a.asset_id = ?
+       ${assetId === null ? '' : 'WHERE a.asset_id = ?'}
        ORDER BY a.username ASC`
     )
-    .bind(assetId)
+    .bind(...(assetId === null ? [] : [assetId]))
     .all<AssetAccountRow & { credential_name: string; credential_type: CredentialType }>();
 
   return (results || []).map((row) => ({
