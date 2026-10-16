@@ -62,10 +62,12 @@
 3. **Cloudflare API 令牌 (`CLOUDFLARE_API_TOKEN`)**：
    * 在 Cloudflare 仪表板 -> 我的个人资料 -> API 令牌 中创建；
    * 需包含以下权限：
-     * **Account / Cloudflare D1 / Edit**
+     * **Account / D1 / Edit**（部分界面显示为 `Cloudflare D1`）
      * **Account / Workers KV Storage / Edit**
      * **Account / Workers Scripts / Edit**
      * **Account / Account Settings / Read**（可选；若不授予此权限，可通过下方的 `CLOUDFLARE_ACCOUNT_ID` 直接指定账户）
+   * **使用 `Edit Cloudflare Workers` 模板时，必须手动添加 `Account / D1 / Edit`**；模板中的 Workers Scripts、KV、R2 等权限不包含 D1。账户资源建议仅选择部署目标账户，并确保与 `CLOUDFLARE_ACCOUNT_ID` 一致。
+   * 若部署在“正在检查 D1 关系型数据库”后报 `Authentication error` / HTTP 403，编辑 Token 补上 D1 权限并检查账户范围，再重新运行部署。若新建了 Token，需将新值更新到 GitHub Actions 的 `CLOUDFLARE_API_TOKEN` Secret 或本地 `.env`。
 4. **Cloudflare 账户 ID (`CLOUDFLARE_ACCOUNT_ID`)**（推荐配置）：
    * 在 Cloudflare 仪表板右侧栏即可复制 `Account ID`；
    * 若你的 API Token 仅关联单一账户且具备账号读取权限，脚本可自动发现；若关联了多个组织/团队账户，请务必配置此项以明确指定目标账户。
