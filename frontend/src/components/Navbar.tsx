@@ -1,6 +1,7 @@
 import React from 'react';
 import { useAuth } from '../context/AuthContext';
 import { Server, Shield, Terminal, Clock, LogOut, User as UserIcon } from 'lucide-react';
+import { isDemoDeployment } from '../../../src/shared/account-policy';
 
 interface NavbarProps {
   currentTab: string;
@@ -64,7 +65,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
       </div>
 
       <div className="flex items-center space-x-4">
-        <button onClick={() => onSelectTab('security')} className="text-sm text-slate-300">账户安全</button>
+        {!isDemoDeployment(deployType) && <button onClick={() => onSelectTab('security')} className="text-sm text-slate-300">账户安全</button>}
         <div className="flex items-center space-x-2 text-sm text-slate-300">
           <UserIcon className="w-4 h-4 text-slate-400" />
           <span>{user.displayName || user.username}</span>

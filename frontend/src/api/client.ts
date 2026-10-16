@@ -16,10 +16,14 @@ async function getCsrfToken(): Promise<string> {
 export class ApiError extends Error {
   public status: number;
   public details?: unknown;
-  constructor(message: string, status: number, details?: unknown) {
+  public code?: string;
+  public requestId?: string;
+  constructor(message: string, status: number, details?: unknown, context?: { code?: string; requestId?: string }) {
     super(message);
     this.status = status;
     this.details = details;
+    this.code = context?.code;
+    this.requestId = context?.requestId;
   }
 }
 
@@ -36,16 +40,19 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     ...options,
     headers,
     credentials: 'same-origin', // Send session cookie
-  });
+  }).catch(() => { throw new ApiError('无法连接服务，请检查网络后重试。', 0); });
 
   if (response.status === 204) {
     return {} as T;
   }
 
-  const data = await response.json().catch(() => ({}));
+  const data = await response.json().catch(() => null) ?? {};
 
   if (!response.ok) {
-    throw new ApiError(data.error || response.statusText || 'Request failed', response.status, data.details);
+    throw new ApiError(typeof data.error === 'string' ? data.error : `请求失败（HTTP ${response.status}），请稍后重试。`, response.status, data.details, {
+      code: typeof data.code === 'string' ? data.code : undefined,
+      requestId: typeof data.requestId === 'string' ? data.requestId : response.headers.get('X-Request-ID') ?? undefined,
+    });
   }
 
   return data as T;

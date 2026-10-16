@@ -1,8 +1,10 @@
-import type { Env, UserRow } from '../types.ts';
+import type { Env } from '../types.ts';
 import type { UserSummary } from '../shared/types.ts';
 import { PASSWORD_ALGORITHM } from '../crypto/password.ts';
 import { hashUserPassword } from './password-service.ts';
 import { recordAuditEvent } from '../audit/audit-service.ts';
+import { getAccountPolicy } from '../shared/account-policy.ts';
+import { BootstrapError, bootstrapFailure } from './bootstrap-errors.ts';
 
 export interface BootstrapInput {
   bootstrapToken: string;
@@ -19,6 +21,14 @@ export interface BootstrapInput {
  * Returns true if setup has not been completed AND no super admin user exists.
  */
 export async function isBootstrapNeeded(db: D1Database): Promise<boolean> {
+  try {
+    return await readBootstrapStatus(db);
+  } catch (error) {
+    throw bootstrapFailure(error, 'BOOTSTRAP_STATUS_UNAVAILABLE');
+  }
+}
+
+async function readBootstrapStatus(db: D1Database): Promise<boolean> {
   // 1. Check system_settings for setup_complete flag
   const setting = await db
     .prepare("SELECT value FROM system_settings WHERE key = 'setup_complete'")
@@ -59,7 +69,7 @@ export async function bootstrapSuperAdmin(
 ): Promise<{ success: boolean; user: UserSummary }> {
   const needed = await isBootstrapNeeded(env.DB);
   if (!needed) {
-    throw new Error('System setup is already completed. Bootstrap is permanently disabled.');
+    throw new BootstrapError('BOOTSTRAP_COMPLETED');
   }
 
   // Validate BOOTSTRAP_TOKEN
@@ -75,61 +85,74 @@ export async function bootstrapSuperAdmin(
         metadata: { reason: 'Invalid or missing bootstrap token' },
       },
       env.DB
-    );
-    throw new Error('Invalid bootstrap token');
+    ).catch((error) => { throw bootstrapFailure(error, 'BOOTSTRAP_SAVE_FAILED'); });
+    throw new BootstrapError(expectedToken ? 'BOOTSTRAP_TOKEN_INVALID' : 'BOOTSTRAP_TOKEN_NOT_CONFIGURED');
   }
 
-  const username = input.username.trim().toLowerCase();
-  if (!username || username.length < 3) {
-    throw new Error('Username must be at least 3 characters long');
+  const policy = getAccountPolicy(env.DEPLOY_TYPE);
+  const username = typeof input.username === 'string' ? input.username.trim().toLowerCase() : '';
+  if (!username) throw new BootstrapError('BOOTSTRAP_USERNAME_REQUIRED');
+  if (username.length < policy.bootstrapUsernameMinLength) {
+    throw new BootstrapError('BOOTSTRAP_USERNAME_TOO_SHORT');
   }
 
-  if (!input.password || input.password.length < 8) {
-    throw new Error('Password must be at least 8 characters long');
+  if (typeof input.password !== 'string' || !input.password) throw new BootstrapError('BOOTSTRAP_PASSWORD_REQUIRED');
+  if (input.password.length < policy.passwordMinLength) {
+    throw new BootstrapError('BOOTSTRAP_PASSWORD_TOO_SHORT');
+  }
+  if ((input.displayName !== undefined && typeof input.displayName !== 'string') ||
+      (input.email !== undefined && typeof input.email !== 'string')) {
+    throw new BootstrapError('BOOTSTRAP_INVALID_REQUEST');
   }
 
   const now = Date.now();
   const userId = `usr_${crypto.randomUUID()}`;
-  const hashedPassword = await hashUserPassword(userId, input.password, env);
+  const hashedPassword = await hashUserPassword(userId, input.password, env).catch((error) => {
+    throw bootstrapFailure(error, 'BOOTSTRAP_PASSWORD_SERVICE_UNAVAILABLE');
+  });
 
   const passwordParams = JSON.stringify({ iterations: hashedPassword.iterations });
 
   // 1. Create Super Admin user record
-  await env.DB.prepare(
-    `INSERT INTO users (
-      id, username, display_name, email,
-      password_hash, password_algorithm, password_params, password_salt,
-      status, mfa_enabled, created_at, updated_at, created_by
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, 'bootstrap')`
-  )
-    .bind(
-      userId,
-      username,
-      input.displayName || 'Super Administrator',
-      input.email ?? null,
-      hashedPassword.hash,
-      PASSWORD_ALGORITHM,
-      passwordParams,
-      hashedPassword.salt,
-      now,
-      now
+  try {
+    await env.DB.prepare(
+      `INSERT INTO users (
+        id, username, display_name, email,
+        password_hash, password_algorithm, password_params, password_salt,
+        status, mfa_enabled, created_at, updated_at, created_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, ?, ?, 'bootstrap')`
     )
-    .run();
+      .bind(
+        userId,
+        username,
+        input.displayName || 'Super Administrator',
+        input.email ?? null,
+        hashedPassword.hash,
+        PASSWORD_ALGORITHM,
+        passwordParams,
+        hashedPassword.salt,
+        now,
+        now
+      )
+      .run();
 
-  // 2. Assign role_super_admin to user
-  await env.DB.prepare(
-    'INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)'
-  )
-    .bind(userId, 'role_super_admin')
-    .run();
+    // 2. Assign role_super_admin to user
+    await env.DB.prepare(
+      'INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)'
+    )
+      .bind(userId, 'role_super_admin')
+      .run();
 
-  // 3. Mark setup_complete = 1 permanently in system_settings
-  await env.DB.prepare(
-    `INSERT OR REPLACE INTO system_settings (key, value, updated_at, updated_by)
-     VALUES ('setup_complete', '1', ?, 'bootstrap')`
-  )
-    .bind(now)
-    .run();
+    // 3. Mark setup_complete = 1 permanently in system_settings
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO system_settings (key, value, updated_at, updated_by)
+       VALUES ('setup_complete', '1', ?, 'bootstrap')`
+    )
+      .bind(now)
+      .run();
+  } catch (error) {
+    throw bootstrapFailure(error, 'BOOTSTRAP_SAVE_FAILED');
+  }
 
   // 4. Record audit event
   await recordAuditEvent(
@@ -146,7 +169,7 @@ export async function bootstrapSuperAdmin(
       metadata: { role: 'role_super_admin' },
     },
     env.DB
-  );
+  ).catch((error) => { throw bootstrapFailure(error, 'BOOTSTRAP_AUDIT_FAILED'); });
 
   return {
     success: true,

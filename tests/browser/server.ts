@@ -6,7 +6,9 @@ import path from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import worker from '../../src/worker.ts';
 import { createSshFixture } from '../ssh-fixture.ts';
-import { resetUserPassword } from '../../src/users/user-service.ts';
+import { createUser, resetUserPassword } from '../../src/users/user-service.ts';
+import { setupMfa, confirmMfa } from '../../src/auth/auth-service.ts';
+import { generateTotpCode } from '../../src/crypto/totp.ts';
 
 const port = Number(process.env.EDGEJUMP_BROWSER_PORT || 4173);
 const origin = `http://127.0.0.1:${port}`;
@@ -16,6 +18,9 @@ for (const user of [fx.topo.admin, fx.topo.alice]) {
   await resetUserPassword(user.id, 'Browser-test-password-42!', fx.topo.admin.id, fx.ctx.env);
   await fx.ctx.db.prepare('UPDATE users SET mfa_enabled = 0 WHERE id = ?').bind(user.id).run();
 }
+const demoUser = await createUser({ username: 'd', password: '1', roles: ['Super Admin'] }, fx.topo.admin.id, { ...fx.ctx.env, DEPLOY_TYPE: 'demo' });
+const demoMfa = await setupMfa(demoUser.id, fx.ctx.env);
+await confirmMfa(demoUser.id, await generateTotpCode(demoMfa.secret), fx.ctx.env);
 fx.ctx.env.ASSETS = { async fetch(request: Request) {
   const pathname = decodeURIComponent(new URL(request.url).pathname);
   const file = path.resolve(dist, `.${pathname === '/' ? '/index.html' : pathname}`);
@@ -34,9 +39,12 @@ async function dispatch(req: http.IncomingMessage) {
   const chunks: Uint8Array[] = [];
   for await (const chunk of req) chunks.push(chunk);
   const body = Buffer.concat(chunks);
+  // This cookie selects the demo environment only in the local browser harness.
+  const demo = headers.get('Cookie')?.split(';').some((cookie) => cookie.trim() === 'edgejump_test_demo=1');
+  const env = demo ? { ...fx.ctx.env, DEPLOY_TYPE: 'demo' } : fx.ctx.env;
   return worker.fetch(new Request(new URL(req.url!, origin), {
     method: req.method, headers, ...(body.length ? { body } : {}),
-  }), fx.ctx.env);
+  }), env);
 }
 const server = http.createServer(async (req, res) => {
   if (req.url === '/__test/ssh-state') {

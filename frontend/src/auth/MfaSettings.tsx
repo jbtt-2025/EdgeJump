@@ -2,9 +2,10 @@ import React, { useState } from 'react';
 import { api } from '../api/client';
 import { useAuth } from '../context/AuthContext';
 import { ShieldCheck } from 'lucide-react';
+import { isDemoDeployment } from '../../../src/shared/account-policy';
 
 export function MfaSettings({ onDone }: { onDone?: () => void }) {
-  const { user, refreshUser, logout } = useAuth();
+  const { user, refreshUser, logout, deployType } = useAuth();
   const [setup, setSetup] = useState<Awaited<ReturnType<typeof api.setupMfa>> | null>(null);
   const [code, setCode] = useState('');
   const [saved, setSaved] = useState(false);
@@ -34,6 +35,14 @@ export function MfaSettings({ onDone }: { onDone?: () => void }) {
     catch (error) { setError((error as Error).message); }
     finally { setBusy(false); }
   }
+
+  if (isDemoDeployment(deployType)) return <main className="min-h-screen bg-slate-950 p-6 flex items-center justify-center text-slate-200">
+    <section className="w-full max-w-xl bg-slate-900 border border-slate-700 rounded-xl p-7 space-y-5">
+      <h1 className="text-2xl font-semibold">账户安全</h1>
+      <p>演示模式使用共享账号，通过用户名和密码直接登录，不开放 MFA 设置。</p>
+      <button onClick={onDone} className="text-blue-400">返回</button>
+    </section>
+  </main>;
 
   return <main className="min-h-screen bg-slate-950 p-6 flex items-center justify-center text-slate-200">
     <section className="w-full max-w-xl bg-slate-900 border border-slate-700 rounded-xl p-7 space-y-5">

@@ -16,6 +16,8 @@ import {
   setupMfa, confirmMfa, disableMfa, isMfaRequired,
 } from '../auth/auth-service.ts';
 import { isBootstrapNeeded, bootstrapSuperAdmin } from '../auth/bootstrap.ts';
+import { BootstrapError } from '../auth/bootstrap-errors.ts';
+import { isDemoDeployment } from '../shared/account-policy.ts';
 import {
   listAssets,
   getAsset,
@@ -85,7 +87,7 @@ import { verifyTotpCode } from '../crypto/totp.ts';
 import { verifyMfaProof } from '../auth/auth-service.ts';
 
 export function isDemoMode(env: Env): boolean {
-  return env.DEPLOY_TYPE?.toLowerCase() === 'demo';
+  return isDemoDeployment(env.DEPLOY_TYPE);
 }
 
 async function isUserAdministrator(userId: string, db: D1Database): Promise<boolean> {
@@ -154,12 +156,9 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
 
   // --- 1. BOOTSTRAP ENDPOINT ---
   if (path === '/api/auth/bootstrap' && method === 'POST') {
-    const needed = await isBootstrapNeeded(env.DB);
-    if (!needed) {
-      return jsonError('Bootstrap is already completed or permanently disabled', 403);
-    }
     const tokenHeader = request.headers.get('x-bootstrap-token') ?? '';
-    const body = await request.json<any>().catch(() => ({}));
+    const body = await request.json<any>().catch(() => { throw new BootstrapError('BOOTSTRAP_INVALID_REQUEST'); });
+    if (!body || typeof body !== 'object' || Array.isArray(body)) throw new BootstrapError('BOOTSTRAP_INVALID_REQUEST');
     const result = await bootstrapSuperAdmin(
       {
         bootstrapToken: tokenHeader || body.bootstrapToken,
@@ -183,6 +182,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
 
   // --- 2. AUTHENTICATION (LOGIN, LOGOUT) ---
   if ((path === '/api/auth/login' || path === '/api/auth/mfa') && method === 'POST') {
+    if (path === '/api/auth/mfa' && isDemoMode(env)) return jsonError('演示模式请使用用户名与密码直接登录。', 403);
     const body = await request.json<any>().catch(() => ({}));
     if (path === '/api/auth/mfa') {
       if (typeof body.challengeToken !== 'string' || (!body.totpCode && !body.recoveryCode)) return jsonError('MFA challenge and code are required', 400);
@@ -297,7 +297,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     return jsonError('Authentication required', 401);
   }
 
-  const currentUser = await validateSession(token, env.DB);
+  const currentUser = await validateSession(token, env.DB, env.DEPLOY_TYPE);
   if (!currentUser) {
     return jsonResponse({ error: 'Invalid or expired session' }, 401, { 'Set-Cookie': buildClearSessionCookie() });
   }
@@ -313,7 +313,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
         roles: currentUser.roles,
         mfaEnabled: currentUser.mfaEnabled,
         mfaPending: currentUser.mfaPending,
-        mfaRequired: await isMfaRequired(currentUser.id, env.DB),
+        mfaRequired: await isMfaRequired(currentUser.id, env.DB, env.DEPLOY_TYPE),
       },
       permissions: currentUser.mfaPending ? [] : Array.from(currentUser.permissions),
       deployType: env.DEPLOY_TYPE || 'production',
@@ -324,6 +324,10 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     recordAuditEvent({ actorUserId: currentUser.id, actorUsername: currentUser.username, action, resourceType,
       resourceId, resourceName, sourceIp: clientIp, userAgent, result: 'success', metadata }, env.DB);
   const context = { sourceIp: clientIp, userAgent };
+
+  if (isDemoMode(env) && method === 'POST' && ['/api/auth/mfa/setup', '/api/auth/mfa/confirm', '/api/auth/mfa/disable'].includes(path)) {
+    return jsonError('演示模式使用共享账号，不开放 MFA 设置。', 403);
+  }
 
   if (method === 'POST' && ['/api/auth/mfa/confirm', '/api/auth/mfa/disable'].includes(path)) {
     const key = `mfa:${currentUser.id}`;
@@ -347,7 +351,7 @@ export async function handleApiRequest(request: Request, env: Env): Promise<Resp
     return jsonResponse({ success: true });
   }
   if (path === '/api/auth/mfa/disable' && method === 'POST') {
-    if (await isMfaRequired(currentUser.id, env.DB)) return jsonError('MFA is required by policy', 403);
+    if (await isMfaRequired(currentUser.id, env.DB, env.DEPLOY_TYPE)) return jsonError('MFA is required by policy', 403);
     const body = await request.json<any>();
     if (!await verifyMfaProof(currentUser.id, body.password, body.code, env)) return jsonError('Invalid password or TOTP code', 403);
     await disableMfa(currentUser.id, env.DB, clientIp, userAgent);

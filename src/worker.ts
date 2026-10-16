@@ -3,8 +3,9 @@ import { SSHSessionDO } from './durable/SSHSessionDO.ts';
 import { RateLimitDO } from './durable/RateLimitDO.ts';
 import { PasswordKdfDO } from './durable/PasswordKdfDO.ts';
 import { PasswordKdfUnavailableError } from './auth/password-service.ts';
+import { BootstrapError } from './auth/bootstrap-errors.ts';
 import { handleApiRequest } from './api/router.ts';
-import { isProductionHttp, httpsRedirect, secureHeaders } from './http-security.ts';
+import { isProductionHttp, httpsRedirect, secureHeaders, jsonResponse } from './http-security.ts';
 
 import { cleanupExpiredRecordings } from './sessions/cleanup-service.ts';
 import { logError } from './logging.ts';
@@ -42,6 +43,11 @@ export default {
       try {
         return await handleApiRequest(request, env);
       } catch (error) {
+        if (error instanceof BootstrapError) {
+          const requestId = crypto.randomUUID();
+          if (error.status >= 500) logError('bootstrap_failed', error.cause ?? error, { requestId, code: error.code });
+          return jsonResponse({ error: error.publicMessage, code: error.code, requestId }, error.status, { 'X-Request-ID': requestId });
+        }
         if (error instanceof PasswordKdfUnavailableError) return secureHeaders(Response.json({ error: error.message }, { status: 503 }));
         logError('api_request_failed', error);
         return secureHeaders(Response.json({ error: 'Request could not be completed' }, { status: 400 }));

@@ -1,0 +1,31 @@
+import { test, expect } from '@playwright/test';
+
+test('shared demo administrator enters without MFA and can manage short user passwords', async ({ page }, testInfo) => {
+  await page.context().addCookies([{ name: 'edgejump_test_demo', value: '1', url: 'http://127.0.0.1:4173' }]);
+  await page.goto('/');
+  await page.getByLabel('用户名', { exact: true }).fill('d');
+  await page.getByLabel('密码', { exact: true }).fill('1');
+  await page.getByRole('button', { name: '立即登录', exact: true }).click();
+  await expect(page.getByRole('button', { name: '堡垒机管理', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '双因素认证', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '账户安全', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: '堡垒机管理', exact: true }).click();
+  await page.getByRole('button', { name: '系统设置', exact: true }).click();
+  await expect(page.getByLabel('登录最长有效期（秒）', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('所有用户强制 MFA', { exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: '用户', exact: true }).click();
+  const administrator = page.getByRole('row').filter({ has: page.getByText('d', { exact: true }) });
+  await expect(administrator).toContainText('演示模式停用');
+  await page.getByRole('button', { name: '新建用户', exact: true }).click();
+  await page.getByLabel('用户名', { exact: true }).fill('s');
+  await page.getByLabel('密码', { exact: true }).fill('1');
+  await page.getByRole('button', { name: '保存', exact: true }).click();
+  const row = page.getByRole('row').filter({ has: page.getByText('s', { exact: true }) });
+  await expect(row).toBeVisible();
+  await row.getByRole('button', { name: '重置密码', exact: true }).click();
+  await page.getByLabel('密码', { exact: true }).fill('2');
+  await page.getByRole('button', { name: '保存', exact: true }).click();
+  await expect(page.getByRole('form', { name: '编辑重置密码', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('status')).toHaveText('已保存');
+  await page.screenshot({ path: testInfo.outputPath('demo-admin.png'), fullPage: true });
+});

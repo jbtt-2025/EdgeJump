@@ -22,9 +22,11 @@ import {
 } from '../crypto/utils.ts';
 import { recordAuditEvent } from '../audit/audit-service.ts';
 import { getAllSettings, getSetting } from '../settings/settings-service.ts';
+import { isDemoDeployment } from '../shared/account-policy.ts';
 
 export const SESSION_TTL_MS = 8 * 3600 * 1000; // 8 hours absolute TTL per Section 7
 export const COOKIE_NAME = 'edgejump_session';
+const DEMO_SESSION_PREFIX = 'demo_';
 
 export interface LoginInput {
   username: string;
@@ -55,7 +57,8 @@ export interface LoginMfaRequiredResult {
 
 export type LoginResult = LoginSuccessResult | LoginMfaRequiredResult;
 
-export async function isMfaRequired(userId: string, db: D1Database): Promise<boolean> {
+export async function isMfaRequired(userId: string, db: D1Database, deployType?: string): Promise<boolean> {
+  if (isDemoDeployment(deployType)) return false;
   const { permissions } = await getUserRolesAndPermissions(userId, db);
   return [...permissions].some((permission) => permission !== 'session.view_own') ||
     await getSetting('require_mfa_for_all', db) === 'true';
@@ -173,6 +176,7 @@ export async function getUserRolesAndPermissions(
  * Authenticates user credentials and optional MFA token, then issues a session token.
  */
 export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
+  const demo = isDemoDeployment(env.DEPLOY_TYPE);
   const username = input.username.trim().toLowerCase();
 
   // 1. Fetch user by username
@@ -226,11 +230,11 @@ export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
     // default to 600,000
   }
 
-  const challengeHash = input.mfaChallenge ? await hashToken(input.mfaChallenge) : null;
+  const challengeHash = !demo && input.mfaChallenge ? await hashToken(input.mfaChallenge) : null;
   const challenge = challengeHash ? await env.DB.prepare(`SELECT user_id FROM auth_mfa_challenges
     WHERE token_hash = ? AND used_at IS NULL AND expires_at > ? AND ip = ?`)
     .bind(challengeHash, Date.now(), input.clientIp).first<{ user_id: string }>() : null;
-  const validPassword = input.mfaChallenge ? challenge?.user_id === user.id : await verifyUserPassword(
+  const validPassword = !demo && input.mfaChallenge ? challenge?.user_id === user.id : await verifyUserPassword(
     user.id,
     input.password,
     user.password_hash,
@@ -259,7 +263,7 @@ export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
   }
 
   // 4. MFA Validation if mfa_enabled is 1
-  if (user.mfa_enabled === 1) {
+  if (!demo && user.mfa_enabled === 1) {
     if (!input.totpCode && !input.recoveryCode) {
       const challengeToken = generateSessionToken();
       await env.DB.prepare('DELETE FROM auth_mfa_challenges WHERE expires_at <= ?').bind(Date.now()).run();
@@ -349,13 +353,14 @@ export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
 
   // 5. Create Web Login Session
   const now = Date.now();
-  const sessionToken = generateSessionToken();
+  // Password-only demo sessions cannot become authenticated production sessions.
+  const sessionToken = `${demo ? DEMO_SESSION_PREFIX : ''}${generateSessionToken()}`;
   const tokenHash = await hashToken(sessionToken);
   const sessionId = `auth_${crypto.randomUUID()}`;
   const settings = await getAllSettings(env.DB);
   const ttlMs = Number(settings.auth_session_absolute_ttl) * 1000;
   const expiresAt = now + ttlMs;
-  const mfaPending = user.mfa_enabled !== 1 && await isMfaRequired(user.id, env.DB);
+  const mfaPending = user.mfa_enabled !== 1 && await isMfaRequired(user.id, env.DB, env.DEPLOY_TYPE);
 
   await env.DB.prepare(
     `INSERT INTO auth_sessions (
@@ -384,7 +389,7 @@ export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
       sourceIp: input.clientIp,
       userAgent: input.userAgent,
       result: 'success',
-      metadata: { mfaUsed: user.mfa_enabled === 1 },
+      metadata: { mfaUsed: !demo && user.mfa_enabled === 1, ...(demo ? { deployType: 'demo' } : {}) },
     },
     env.DB
   );
@@ -397,7 +402,7 @@ export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
     displayName: user.display_name,
     email: user.email,
     status: user.status,
-    mfaEnabled: user.mfa_enabled === 1,
+    mfaEnabled: !demo && user.mfa_enabled === 1,
     roles,
     createdAt: user.created_at,
     lastLoginAt: now,
@@ -419,11 +424,14 @@ export async function login(input: LoginInput, env: Env): Promise<LoginResult> {
  */
 export async function validateSession(
   sessionToken: string,
-  db: D1Database
+  db: D1Database,
+  deployType?: string
 ): Promise<AuthenticatedUser | null> {
+  const demo = isDemoDeployment(deployType);
   if (!sessionToken || sessionToken.trim() === '') {
     return null;
   }
+  if (!demo && sessionToken.startsWith(DEMO_SESSION_PREFIX)) return null;
 
   const tokenHash = await hashToken(sessionToken);
   const now = Date.now();
@@ -469,8 +477,8 @@ export async function validateSession(
     email: user.email,
     roles,
     permissions,
-    mfaEnabled: user.mfa_enabled === 1,
-    mfaPending: session.mfa_pending === 1 || (user.mfa_enabled !== 1 && await isMfaRequired(user.id, db)),
+    mfaEnabled: !demo && user.mfa_enabled === 1,
+    mfaPending: !demo && (session.mfa_pending === 1 || (user.mfa_enabled !== 1 && await isMfaRequired(user.id, db, deployType))),
   };
 }
 
@@ -526,6 +534,7 @@ export async function setupMfa(
   userId: string,
   env: Env
 ): Promise<{ secret: string; uri: string; recoveryCodes: string[] }> {
+  if (isDemoDeployment(env.DEPLOY_TYPE)) throw new Error('MFA settings are disabled in demo mode');
   const masterKek = env.CREDENTIAL_KEK_V1;
   if (!masterKek) {
     throw new Error('CREDENTIAL_KEK_V1 is required for MFA setup');
@@ -588,6 +597,7 @@ export async function confirmMfa(
   clientIp: string = '127.0.0.1',
   userAgent?: string
 ): Promise<boolean> {
+  if (isDemoDeployment(env.DEPLOY_TYPE)) throw new Error('MFA settings are disabled in demo mode');
   const masterKek = env.CREDENTIAL_KEK_V1;
   if (!masterKek) {
     throw new Error('CREDENTIAL_KEK_V1 is required for MFA confirmation');

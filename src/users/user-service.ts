@@ -6,6 +6,7 @@ import { hashUserPassword } from '../auth/password-service.ts';
 import { recordAuditEvent } from '../audit/audit-service.ts';
 import { terminateSession } from '../sessions/session-service.ts';
 import { getSetting } from '../settings/settings-service.ts';
+import { getAccountPolicy } from '../shared/account-policy.ts';
 
 export interface UserSummary {
   id: string;
@@ -98,9 +99,10 @@ export async function createUser(
   clientIp: string = '127.0.0.1',
   userAgent?: string
 ): Promise<UserSummary> {
-  const username = input.username.trim().toLowerCase();
+  const username = typeof input.username === 'string' ? input.username.trim().toLowerCase() : '';
   if (!username) throw new Error('Username is required');
-  if (!input.password || input.password.length < 8) {
+  if (typeof input.password !== 'string' || !input.password) throw new Error('Password is required');
+  if (input.password.length < getAccountPolicy(env.DEPLOY_TYPE).passwordMinLength) {
     throw new Error('Password must be at least 8 characters');
   }
 
@@ -367,7 +369,8 @@ export async function resetUserPassword(
   clientIp: string = '127.0.0.1',
   userAgent?: string
 ): Promise<void> {
-  if (!newPassword || newPassword.length < 8) {
+  if (typeof newPassword !== 'string' || !newPassword) throw new Error('Password is required');
+  if (newPassword.length < getAccountPolicy(env.DEPLOY_TYPE).passwordMinLength) {
     throw new Error('Password must be at least 8 characters');
   }
 

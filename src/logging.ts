@@ -1,7 +1,7 @@
 // Log identifiers and error categories only. Runtime exceptions may contain remote
 // terminal text, request bodies or secrets and must never be logged verbatim.
-export function logError(operation: string, error: unknown): void {
-  console.error(operation, { category: error instanceof Error ? error.name : 'Error' });
+export function logError(operation: string, error: unknown, context?: { requestId: string; code: string }): void {
+  console.error(operation, { category: error instanceof Error ? error.name : 'Error', ...context });
 }
 
 export function publicError(error: unknown, fallback: string): string {
